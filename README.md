@@ -1,263 +1,405 @@
-# Xiaomi Smart Scale S200 (MJTZC02YM) — BLE GATT protocol, reverse-engineered
+# Xiaomi Smart Scale S200: Bluetooth protocol and sync client
 
-A from-scratch, byte-verified reverse engineering of how the **Xiaomi Smart
-Scale S200** (BLE model, product id/device id prefixed `blt.`) actually
-delivers a weight reading over Bluetooth — and a small standalone Python
-script (`scale_reader.py`) that logs in and streams readings without the
-Xiaomi Home app.
+Everything needed to get weigh-ins off a **Xiaomi Smart Scale S200** over
+Bluetooth LE without the Xiaomi Home app or the cloud. It contains:
 
-There is no public documentation for this device's protocol. This exists
-because the community tooling that *does* support similarly-named Xiaomi
-scales (Home Assistant's `xiaomi-ble`, openScale) only implements the
-simpler MiBeacon **advertisement**-encryption scheme — and this specific
-scale/firmware **never uses it for weight**. Getting a real reading out of
-it requires an authenticated GATT session instead. This repo documents
-that session end to end.
+- a protocol reference, fully decrypted from HCI captures of the official app;
+- `scale_reader.py`, a small sync client that delivers every weigh-in, with
+  the scale's own timestamp, to a webhook or stdout;
+- tools to decrypt your own captures, plus a simulated scale to develop
+  against without owning one.
 
-## The core finding: this scale does not broadcast weight
+**Status:** verified against one real scale (firmware `2.1.2_0008.0010`) in
+September 2026: the client collected weigh-ins both live and from the
+scale's memory, including ones stored while it was out of range.
+There's no official documentation for this protocol; everything here was
+reverse-engineered, and the [open questions](#open-questions) list what
+isn't known. This README replaces an earlier version that got several key
+things wrong. See [corrections](#corrections-to-the-first-version) if
+you used that code.
 
-Every community Xiaomi-scale integration assumes the device pushes its
-reading inside an encrypted MiBeacon BLE *advertisement* (a broadcast,
-no connection required) — this is how most modern Xiaomi/Mijia sensors
-work, and it's what `xiaomi-ble`'s `obj4e16` parser (object id `0x4E16`)
-is built to decode.
+## The short version
 
-**Confirmed via extensive live testing** (including a full patient capture
-spanning a complete weigh-in cycle, on-scale, watching it wake, measure,
-and go back to sleep): this device's advertisements are, in every
-observed state, an 11-byte minimal MiBeacon frame — `frame_control` +
-`product_id` + `counter` + `MAC` — with **no object payload at all**.
-Object `0x4E16` never appears. If your goal is passive/broadcast-only
-listening for this exact model, stop here — it won't work; the vendor
-never puts weight on the air.
+For anyone implementing their own client (Home Assistant, ESPHome, a phone
+app...), these are the facts that matter:
 
-## Where the weight actually is: an authenticated GATT session
+1. **The weight is never broadcast.** Advertisements only carry a minimal
+   MiBeacon frame. You have to connect over GATT and log in with Xiaomi's
+   "miauth" scheme, using the device's cloud **TOKEN** (12 bytes). That's
+   not the "BLE KEY"/bindkey that other Xiaomi sensors use.
+2. **The scale keeps every weigh-in in memory** (weight + unix timestamp)
+   until a client deletes it. You don't need to be connected while someone
+   weighs themselves. Fetch the stored weigh-ins later (action 6.1), then
+   delete them (action 6.2).
+3. **The advertisements tell you when there's something new.** The MiBeacon
+   frame counter counts weigh-ins stored since the batteries went in. So a
+   passive listener knows when to connect.
+4. **A connection keeps the scale awake.** Never poll-connect: a client that
+   reconnects whenever it sees the scale keeps it awake forever, and flattens
+   the batteries. Connect once per wake-up, and disconnect as soon as nobody
+   is on the scale.
+5. **Values can arrive in pieces.** Anything bigger than one BLE write
+   (e.g. a list of stored weigh-ins) arrives as a *framed*, multi-parcel
+   transfer. The receiver acknowledges it once before and once after all
+   the parcels, not per parcel.
+6. **Do the `a4` probe before login.** It tells the scale how big a single
+   value can be. Without it, the scale assumes 20 bytes and frames
+   everything.
 
-The real reading is delivered only after connecting and completing
-Xiaomi's older `mible`/"miauth" secure-login scheme — the same general
-scheme documented for a couple of other Xiaomi BLE products (e.g. a
-diffuser, and a kettle at
-[opravdin/hass-yunmi-kettle-ble](https://github.com/opravdin/hass-yunmi-kettle-ble)'s
-`PROTOCOL.md`, which was a useful cross-reference for the framing/ack
-mechanics below) — followed by a small set of app→device setup commands,
-after which the device streams AES-CCM encrypted property pushes,
-including the weight record.
+## Quick start
 
-### Two different secrets, from the same tool
+### 1. Get the token
 
-Both come from running
-[`Xiaomi-cloud-tokens-extractor`](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
-against your own Xiaomi account, but reading **two different output
-fields** — mixing them up is the single most likely reason this will fail
-for you:
+Run [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
+against the Xiaomi account the scale is paired with. It prints two keys for
+the scale; you need **`TOKEN`** (24 hex characters). **`BLE KEY`** (32 hex
+characters) is the advertisement key and doesn't work for this. Mixing them
+up is the most common reason logins fail. You also need the scale's
+Bluetooth MAC address, which the extractor prints too.
 
-- **`BLE KEY`** (16 bytes / 32 hex chars) — the MiBeacon *advertisement*
-  encryption key. **Not used here** (see above — this device doesn't
-  broadcast weight), kept only for completeness / in case a future
-  firmware or a sibling model does put something on the air.
-- **`TOKEN`** (12 bytes / 24 hex chars — shorter than the usual 16-byte
-  Xiaomi miIO token because this is a BLE-only device) — this is the
-  actual GATT-login secret, used as the HKDF input key material. This is
-  the one `scale_reader.py` needs (`XIAOMI_TOKEN`).
+### 2. Run it
 
-Confirmed correct two independent ways: the derived session key's HMAC
-proof matched the real device's own proof byte-for-byte across two
-separate capture sessions, and the resulting decryption produced a weight
-record that matched the scale's own on-screen reading (89.75 kg) exactly.
-
-### GATT characteristics (service `0xfe95`)
-
-Raw ATT *value handles* are **not stable** for this device — a different
-central connecting (this script, vs. the phone in the original captures)
-gets handed a completely different handle layout for the identical
-characteristics. Resolve these four by **UUID** instead:
-
-| Role  | UUID                                   | Purpose                                                        |
-|-------|-----------------------------------------|------------------------------------------------------------------|
-| LOGIN | `00000010-0000-1000-8000-00805f9b34fb` | write `CMD_LOGIN`; notifies `CFM_LOGIN_OK`                       |
-| AUTH  | `00000019-0000-1000-8000-00805f9b34fb` | miauth key exchange (`rand_key`/`remote_key`/`remote_info`/`login_info`) |
-| CMD   | `0000001a-0000-1000-8000-00805f9b34fb` | app → device encrypted commands + flow-control acks              |
-| PROP  | `0000001b-0000-1000-8000-00805f9b34fb` | device → app encrypted property/data pushes                      |
-
-### The login handshake (miauth)
-
-1. Write `CMD_LOGIN = 24000000` to LOGIN.
-2. On AUTH: send a 16-byte random `rand_key`.
-3. Receive the scale's 16-byte `remote_key` (tag `0x0d`) and its 32-byte
-   HMAC proof `remote_info` (tag `0x0c`).
-4. Derive session keys:
-   ```
-   HKDF-SHA256(ikm=XIAOMI_TOKEN, salt=rand_key+remote_key,
-               info=b"mible-login-info", length=64)
-     -> dev_key(16) | app_key(16) | dev_iv(4) | app_iv(4)
-   ```
-5. Verify the device's proof **before** sending your own (fail fast on a
-   wrong token instead of waiting for the device to reject you):
-   `HMAC-SHA256(dev_key, remote_key + rand_key) == remote_info`.
-6. Send your own proof: `login_info = HMAC-SHA256(app_key, rand_key + remote_key)`.
-7. Wait for `CFM_LOGIN_OK = 21000000` on LOGIN.
-
-AES-CCM nonce construction (both directions): `iv(4 bytes) + 00000000 +
-counter(4 bytes, little-endian)`, `tag_length=4`.
-
-### The "direct" vs "framed" dual transfer form
-
-Both original phone captures show every AUTH/PROP message delivered as a
-single **"direct"** notification: `00 00 02 <tag>` + data, comfortably
-fitting inside the official app's negotiated 251-byte ATT_MTU.
-
-A client that does **not** negotiate a larger ATT_MTU (this script
-included — see "the MTU trap" below) instead gets the same values
-delivered in a **"framed"** (multi-parcel) form, symmetric to the
-mechanism the app itself uses for its own outgoing writes:
-
-```
-00 00 00 <tag> <parcel_count:le16>      -- header notification
-  (repeat parcel_count times:)
-  -> write RCV_RDY (00000101)            -- "I'm ready"
-  <- <parcel_no:le16><chunk>              -- one parcel, notified
-  -> write RCV_OK  (00000100)            -- "got it"
--- concatenate all chunks in order -> the same bytes the direct form
-   would have delivered in one shot
-```
-
-This isn't specific to AUTH — the **same framed form shows up on PROP
-too**, for property pushes, confirmed live even *after* a successful
-login. Any client for this device needs to handle both forms on both
-characteristics, not just at login.
-
-### The MTU trap
-
-The official app explicitly negotiates ATT_MTU=251 before doing anything
-else, which is almost certainly why its captures only ever show the
-compact "direct" form. A natural fix is to force a larger MTU yourself —
-but depending on your BLE stack, this can be harder than it looks:
-`bleak`'s BlueZ backend has a private `BleakClient._acquire_mtu()` method
-for exactly this, but **on at least one recent `bleak` version, that
-method doesn't exist at all** (`AttributeError`) — silently, unless you
-check for it. Rather than depend on MTU negotiation succeeding at all,
-this script implements the framed/multi-parcel form properly and treats
-a larger MTU as a nice-to-have, not a requirement.
-
-### App→device setup commands
-
-Sent once, in order, right after login (all AES-CCM encrypted with
-`app_key`/`app_iv`, framed as single-parcel writes on CMD):
-
-1. **Open session** — op `0xF0`: `[0x05, 0x20, tid_le16, 0xF0]`.
-2. **Status probe** — op `0x05`/sub `0x06`:
-   `[0x08, 0x20, tid_le16, 0x05, 0x06, 0x01, 0x00]` (purpose not fully
-   decoded; both real sessions sent it, harmless to replicate).
-3. **User profile push** — op `0x05`/sub `0x07`, a small JSON blob
-   (`mid`/`age`/`sex`/`hi` fields) the app sends for the scale's own
-   on-device body-composition math. Not required for `weight_kg` itself.
-4. **Property subscribe** — op `0x05`/sub `0x06` again, with a
-   comma-separated `piid` list appended. **This is the one that matters**:
-   empirically, the scale does not push weight-bearing records until
-   after this request — it does send small periodic "heartbeat" pushes
-   regardless, which conveniently double as liveness checks.
-
-### Decoding a weight record
-
-PROP notifications carry a 2-byte little-endian counter (used as the
-AES-CCM nonce counter) followed by the ciphertext+4-byte tag. Decrypt with
-`dev_key`/`dev_iv`. A decrypted frame whose 5th byte (`plaintext[4]`) is
-`0x07` is a data-record push. Find the `0xa0` marker byte; everything
-after it is an ASCII, comma-separated record ending
-`...,<flag>,<unix_timestamp>`. **The field immediately before that
-trailing pair is the weight, in hundredths of a kilogram** — i.e.
-`int(field) / 100 == weight_kg`. Confirmed exact against a real 89.75 kg
-on-screen ground-truth reading.
-
-Body composition fields (body fat %, impedance, muscle mass, etc.) are
-almost certainly present in some of the other recurring push types that
-weren't needed to get weight working and so weren't decoded here — if you
-get further on that, a PR or issue with findings is very welcome.
-
-### Known gaps
-
-- **A third PROP notification shape shows up that isn't decoded.**
-  Besides the direct and framed forms above, live sessions also produce
-  notifications that don't match either prefix, and occasionally a
-  direct-form message whose AES-CCM tag simply fails to verify even
-  though the same session's login already succeeded (so the key material
-  itself is correct). Both look like a third transfer/framing mode this
-  writeup hasn't cracked yet — possibly a running per-notification
-  sequence number rather than a fixed marker byte, based on the raw bytes
-  observed (`03 00...`, `04 00...`, `05 00...` in sequence). `scale_reader.py`
-  treats both cases as non-fatal (logs and keeps listening on the same
-  connection) rather than tearing down the session over them, since a
-  real weight push reliably still arrives afterward in practice. If you
-  get further on decoding this shape, that's exactly the kind of finding
-  worth a PR or issue.
-
-## How this was actually reverse-engineered
-
-1. On an Android phone with the Xiaomi Home app installed: Developer
-   Options → enable "Bluetooth HCI snoop log".
-2. Do a real weigh-in with the official app, ideally noting the on-screen
-   reading immediately after (ground truth for calibrating the value
-   field).
-3. Pull the resulting `btsnoop_hci.log` off the phone.
-4. Parse the raw btsnoop framing (8-byte file magic + version/datalink
-   header, then 24-byte record headers + HCI packet data) and track LE
-   Connection Complete events to map connection handles to the scale's BD
-   address, then extract every ATT-protocol (GATT) exchange on that
-   handle. A small standalone parser for this is included here
-   (`parse_btsnoop.py`) since no existing tool does exactly this framing
-   extraction.
-5. Read the GATT characteristic declarations (`Read By Type Response`,
-   ATT opcode `0x09`, GATT UUID `0x2803`) for service `0xfe95` to get the
-   stable UUID↔role mapping, independent of the (unstable) raw handles.
-6. Diff two independent captures against each other to separate "always
-   the same" (protocol/opcodes) from "varies" (session-specific nonces,
-   counters, timestamps).
-7. Verify the derived crypto material and decoded values against the
-   ground-truth on-screen reading before trusting any of it.
-
-If this ever stops working (e.g. after a firmware update), **repeat this
-exact process** — capture fresh, diff against what's documented here, and
-open an issue/PR with what changed.
-
-## Usage
+On a Linux machine with a working BlueZ (`bluetoothd`), run it directly:
 
 ```bash
 pip install -r requirements.txt
-
-export XIAOMI_MAC=AA:BB:CC:DD:EE:FF     # the scale's BLE MAC
-export XIAOMI_TOKEN=<24 hex chars>      # the cloud extractor's TOKEN field, NOT the BLE KEY
-# optional:
-export XIAOMI_BINDKEY=<32 hex chars>    # BLE KEY field; currently unused, kept for parity
-export WEBHOOK_URL=https://example.com/ingest   # POSTed {"weight_kg": ...} on every new reading
-
+export XIAOMI_MAC=AA:BB:CC:DD:EE:FF
+export XIAOMI_TOKEN=0123456789abcdef01234567
+export WEBHOOK_URL=https://example.com/weigh-ins   # optional, see below
 python scale_reader.py
 ```
 
-Runs as a persistent daemon: connects, logs in, subscribes, and streams
-decrypted readings indefinitely, reconnecting with backoff on disconnect.
-Prints every decoded weight to stdout regardless of whether `WEBHOOK_URL`
-is set. Backs off much further (`ASLEEP_RETRY_S`, default 60s) when the
-scale can't be found via scan at all — this device is asleep almost all
-of the time, and constant fast re-scanning was observed live to keep its
-display/radio powered on continuously, draining its battery for no
-benefit. Only backs off quickly (a few seconds) for failures that happen
-once the scale is actually reachable, since a real weigh-in's awake
-window is short (observed ~10–30s).
+On a host without BlueZ (e.g. a Synology NAS), use the Docker image. It runs
+its own `dbus-daemon` + `bluetoothd`, so don't use it on a host whose own
+`bluetoothd` is using the same adapter:
 
-Requires a Bluetooth adapter and a BlueZ stack (`bluetoothd`) the device
-running this can talk to over D-Bus — a normal Linux BLE setup. This was
-developed and run inside a container with its own internal
-`dbus-daemon`/`bluetoothd`, talking to a physical adapter passed through
-via `--network host --privileged`; adapt to your own environment.
+```bash
+docker build -t s200 .
+docker run -d --name s200 --restart unless-stopped --net=host --privileged \
+  -e XIAOMI_MAC=... -e XIAOMI_TOKEN=... -e WEBHOOK_URL=... s200
+```
 
-Only one BLE central can hold a GATT connection to the scale at a time —
-if this script is connected when you try to weigh in via the Xiaomi Home
-app itself, one of the two logins will fail.
+The kernel still needs Bluetooth support. Synology/Xpenology kernels don't
+have it; see [xpenology-bt-epyc7002](https://github.com/faraga1/xpenology-bt-epyc7002).
+To load out-of-tree modules at startup, mount them at `/bt-modules`
+(`-v /path/to/modules:/bt-modules:ro`). The entrypoint then loads them
+whenever `hci0` is missing.
 
-## Origin
+### Configuration
 
-Built while getting a personal weight-tracking app to auto-log readings
-from this exact scale model, without depending on the Xiaomi Home app.
-Extracted here since the protocol itself — not the app it feeds — is what
-seemed worth sharing; no other public writeup for this device's GATT
-protocol seems to exist.
+| Variable | |
+|---|---|
+| `XIAOMI_MAC` | Required. The scale's Bluetooth address. |
+| `XIAOMI_TOKEN` | Required. The cloud `TOKEN` (24 hex chars). |
+| `WEBHOOK_URL` | Where to POST each weigh-in as JSON: `{"weight_kg": 80.25, "recorded_at": "2026-09-30T07:15:42Z"}`. Unset: prints one JSON line per weigh-in to stdout. |
+| `WEBHOOK_TOKEN` | Optional. Sent as `Authorization: Bearer <token>`. |
+| `KEEP_ON_SCALE` | `1` = never delete or claim weigh-ins on the scale, e.g. to keep the Xiaomi Home app working alongside. They're then delivered again on every sync, and the scale keeps waking up to offer them. |
+| `XIAOMI_PROFILE_MEMBER_ID`, `_AGE`, `_SEX`, `_HEIGHT_CM`, `_WEIGHT_KG` | The user profile pushed to the scale (see [action 7.1](#services)). Only affects the scale's display and user recognition. If you also use the Xiaomi app, set the member id to your account's (the `mid` in the app's own profile push). |
+| `LOG_LEVEL` | `DEBUG` logs every raw BLE value. |
+
+A weigh-in only counts as delivered, and gets deleted from the scale, once
+the webhook returned 2xx (or it was printed). If your endpoint is down,
+weigh-ins stay on the scale until the next sync. The same weigh-in can be
+delivered twice (e.g. when a sync is retried), so **deduplicate on
+`recorded_at` + `weight_kg`**.
+
+## How the scale behaves
+
+All observed on one unit; see [open questions](#open-questions) for what's
+still unclear.
+
+- **Asleep:** no advertising, not connectable. Stepping on it wakes it up.
+- **Awake:** advertises every ~0.5 s. With no client connected it goes back
+  to sleep ~15 s after the last activity. **While a client is connected it
+  stays awake**, and it falls asleep within seconds of the disconnect.
+- **Memory:** every finished weigh-in is stored with a record number (which
+  keeps counting up, even across battery changes) and a unix timestamp.
+  Stored weigh-ins survived 10 days without batteries.
+- **Self-wake:** while it holds uncollected weigh-ins, it wakes up by itself
+  to offer them. Once, it woke ~3 minutes after falling asleep, with nobody
+  near it. It was never seen waking by itself with an empty memory.
+- **MiBeacon frame counter** (in the advertisement): the number of weigh-ins
+  stored since the batteries went in, mod 256. It went 0 → 6 → 7 → 8 in step
+  with stored records. A weigh-in a client claims live (action 4.3) isn't
+  stored, and doesn't count.
+- **Clock:** set by the `"time"` field of the profile push (action 7.1).
+  Record timestamps are UTC unix time.
+- **User recognition:** a stored weigh-in has flag `0` plus the member id if
+  its weight was close to the profile's reference weight (`"wt"`).
+  Otherwise it has flag `2` and member id `0`. The weight is stored either
+  way.
+- **One client at a time.** The Xiaomi Home app deletes the stored weigh-ins
+  it collects, so anything it syncs never reaches your client.
+
+## Protocol reference
+
+### Advertisement
+
+Service data for UUID `0xfe95`: `10 59 cb 4d NN <MAC, reversed>`.
+
+| Bytes | Meaning |
+|---|---|
+| `10 59` | frame control `0x5910`: MiBeacon v5, bound, MAC included, no object, not encrypted |
+| `cb 4d` | product id `0x4dcb` |
+| `NN` | frame counter (stored weigh-ins since power-on) |
+| MAC | little-endian |
+
+The scan response carries the name `Xiaomi Scale S200 XXXX` (the last four
+hex digits of the MAC). No object ever appears: no weight, not even
+encrypted. Tooling that decodes MiBeacon objects (e.g. Home Assistant's
+`xiaomi-ble`) can't read this scale.
+
+### GATT
+
+All four characteristics are in service `0xfe95`. **Look them up by UUID.**
+ATT handles differ between clients (the phone and a Linux/BlueZ client got
+different layouts).
+
+| Name | UUID | Direction |
+|---|---|---|
+| LOGIN | `00000010-0000-1000-8000-00805f9b34fb` | write `a4` / `24000000`; notifies `21000000` on login |
+| AUTH | `00000019-0000-1000-8000-00805f9b34fb` | payload-size probe and key exchange, both ways |
+| CMD | `0000001a-0000-1000-8000-00805f9b34fb` | encrypted requests, app → scale (+ acks back) |
+| PROP | `0000001b-0000-1000-8000-00805f9b34fb` | encrypted results and events, scale → app (+ acks back) |
+
+Enable notifications on AUTH, CMD and PROP, then do the probe, and only then
+enable LOGIN. That's the Xiaomi app's order, with ~200 ms before the login
+starts. A client that enabled all four up front and started the login
+straight after the probe got no answer to about half its logins. After
+switching to the app's order, every login attempt observed so far (4 of
+4) succeeded first time. The root cause isn't known.
+
+### Framing (AUTH, CMD, PROP)
+
+Every value is sent one of two ways:
+
+- **Direct**: `00 00 02 <tag> <data>`, when the value fits in one write. The
+  receiver answers `00 00 03 00`.
+- **Framed**: when it doesn't fit.
+
+  ```
+  sender   → 00 00 00 <tag> <n:le16>      header: n parcels follow
+  receiver → 00 00 01 01                  ready (once)
+  sender   → 01 00 <chunk>                parcel 1
+  sender   → 02 00 <chunk>                parcel 2   (back to back, no ack in between)
+  ...
+  sender   → <n:le16> <chunk>             parcel n
+  receiver → 00 00 01 00                  received (once)
+  ```
+
+  The value is the chunks concatenated in parcel order. A full parcel
+  carries *(max value size − 2)* bytes.
+
+Tags: `0x00` encrypted data (CMD/PROP), `0x0b` rand_key, `0x0d` remote_key,
+`0x0c` remote_info, `0x0a` login_info. The scale uses direct whenever it
+can. The Xiaomi app (and this client) always sends framed, even for a
+single parcel.
+
+**Payload-size probe (before login):** write `a4` to LOGIN. On AUTH the
+scale sends `00 00 04 00 06 f2`, which you echo as `00 00 05 00 06 f2`. It
+then sends `00 00 04 01` + a run of `f2` bytes, which you echo back the same
+way (`04 01` → `05 01`). The length of that big probe is the largest value
+the scale accepts in one write: 244 bytes at the 251-byte ATT MTU that BlueZ
+and Android negotiate. Skip the probe and the scale assumes 20 bytes.
+
+### Login (miauth)
+
+```
+LOGIN ← 24 00 00 00
+AUTH  ⇄ rand_key (tag 0x0b, 16 random bytes)                    app → scale
+AUTH  ⇄ remote_key (tag 0x0d, 16 bytes)                          scale → app
+AUTH  ⇄ remote_info (tag 0x0c, 32 bytes)                         scale → app
+        keys = HKDF-SHA256(ikm=TOKEN, salt=rand_key + remote_key,
+                           info=b"mible-login-info", length=64)
+        dev_key, app_key, dev_iv, app_iv = keys[0:16], keys[16:32], keys[32:36], keys[36:40]
+        check remote_info == HMAC-SHA256(dev_key, remote_key + rand_key)   # wrong token fails here
+AUTH  ⇄ login_info = HMAC-SHA256(app_key, rand_key + remote_key) (tag 0x0a)   app → scale
+LOGIN → 21 00 00 00                                             login OK
+```
+
+### Encryption
+
+After login, every CMD/PROP value is `<ctr:le16><AES-CCM ciphertext, 4-byte
+tag>`:
+
+- nonce = `iv (4 bytes) + 00 00 00 00 + ctr (le32)`, no associated data;
+- `app_key`/`app_iv` for app → scale, with your own counter starting at 0;
+- `dev_key`/`dev_iv` for scale → app, using the counter in each value.
+
+### Messages
+
+Decrypted payloads are Xiaomi MIoT-spec operations:
+
+```
+<len_type:le16 = 0x2000 | total_length> <tid:le16> <op> <body>
+
+op 0xf0  hello     no body; the scale echoes it (same tid). Sent first.
+op 0x05  action    <siid> <aiid> <n> <n params>
+op 0x06  result    <status:le16> [<n> <n params>]     reply to an action, same tid
+op 0x07  event     <siid> <eiid> 00 <n> <n params>    sent by the scale (own tids)
+
+param:   <piid:le16> <type_len:le16 = type << 12 | length> <value>
+types seen: 0x1 u8, 0x3 u16 (le), 0x8 u64 (le), 0xa string
+```
+
+Example: a live-weight event, 90.00 kg, not yet stable:
+
+```
+19 20  0f 00  07  05 03 00 03   01 00 01 10 00   02 00 01 10 00   03 00 02 30 28 23
+len    tid    ev  5.3   (3 params) p1 u8 = 0      p2 u8 = 0         p3 u16 = 0x2328 = 9000
+```
+
+### Services
+
+| | Params | Meaning |
+|---|---|---|
+| action **7.1** | p1 = profile JSON (string) | Set the user profile and the clock. Result: p2 = number of stored weigh-ins, p3 = serial, p4 = MAC, p5 = firmware, p6 = 0. The Xiaomi app sends this right after hello on every connection. |
+| action **6.1** | none | Fetch stored weigh-ins. Result: p3 = count. If non-zero, the scale then sends **event 6.1**, p1 = the records (below), framed when long. |
+| action **6.2** | p2 = `"41,42,43"` | Delete stored weigh-ins by record number. The app deletes everything it fetched. |
+| event **5.3** | p1 = 0, p2 = stable (0/1), p3 = weight (u16, 1/100 kg) | Live weight while someone is on the scale, ~every 0.7 s. |
+| event **5.4** | p4 = `"member_id,user_type,weight,flag,ts"` | The weigh-in finished. |
+| action **4.3** | p1 = member id (u64), p2 = 1 (u8), p8 = weight (u16) | Claim a finished weigh-in (the app does this after every 5.4). A claimed weigh-in isn't stored. |
+
+Profile JSON, exactly as the app sends it (keys in this order):
+
+```json
+{"mid":"<member id>","duid":1,"uc":1,"ow":1,"unit":1,"time":<unix now>,"ud":[{"duid":1,"ut":1,"age":30,"sex":1,"hi":180,"wt":8025}]}
+```
+
+`wt` is the user's current weight in 1/100 kg; the app sends the latest
+weigh-in. `unit` 1 = kg.
+
+Stored weigh-ins (event 6.1, p1): records joined by `_`, oldest first,
+each `no,member_id,user_type,weight,flag,unix_ts`, e.g.
+
+```
+41,1,1,8025,0,1790000000_42,0,0,7260,2,1790000060
+```
+
+The weight is in 1/100 kg: `8025` is 80.25 kg. `flag` 0 = recognised user,
+2 = unrecognised (member id 0, user_type 0).
+
+**No body-composition values** (impedance, body fat...) appear anywhere in
+the protocol. As far as the traffic shows, the S200 only measures weight.
+
+### A sync session
+
+```
+connect; notify on AUTH, CMD, PROP; probe; ~200 ms; notify on LOGIN; login
+→ hello                         ← hello
+→ action 7.1 (profile + clock)  ← result: 12 stored
+→ action 6.1                    ← result: count 12
+                                ← event 6.1: 12 records (framed, 2 parcels)
+  (deliver them)
+→ action 6.2 "29,...,40"        ← result: ok
+                                ← event 5.3 ×n, then 5.4   (if someone is on the scale)
+→ action 4.3 (claim)            ← result: ok
+disconnect as soon as it's quiet
+```
+
+Live events can arrive at any point after login, even before hello. A
+client needs a receive loop that dispatches results (by tid) and events
+independently of whatever request it's waiting on.
+
+## Designing a client
+
+`scale_reader.py` does the following. It's the design that got the scale's
+battery use close to zero between weigh-ins:
+
+1. **Only scan** (in 10 s windows) until the scale shows up after a full
+   window without it. That means it just woke up.
+2. **Connect once:** log in, push the profile (this sets the clock), fetch,
+   deliver and delete the stored weigh-ins.
+3. **Stay connected only while someone is using the scale.** Disconnect 5 s
+   after syncing if there's no live weight, or 15 s after the last live
+   update. Then check the store once more.
+4. **Don't connect again until the scale has gone back to sleep.** The one
+   exception: the frame counter differs from what it should be after the
+   sync (the counter in the advertisement that triggered the sync, plus any
+   stored weigh-ins collected that are newer than it). That means another
+   weigh-in was stored. If a sync triggered by the counter finds nothing,
+   stop following the counter until the scale sleeps, so it can never turn
+   into a reconnect loop.
+5. **Retry a failed login up to 4 times** within the same wake-up.
+
+## Tools
+
+| File | |
+|---|---|
+| `scale_reader.py` | The sync client. Its docstring is a condensed version of this README. |
+| `test_scale_reader.py` | Runs the real client code against `FakeScale`, a simulation of the scale's side of the protocol. No Bluetooth needed: `python -m unittest test_scale_reader -v`. Start here if you're porting this to another language or platform. |
+| `decode_btsnoop.py` | Decrypts an Android HCI snoop capture: both directions, direct and framed, all messages decoded. `XIAOMI_TOKEN=... python decode_btsnoop.py btsnoop_hci.log <mac>` |
+| `parse_btsnoop.py` | Dumps the raw ATT traffic of a capture (no decryption); useful to re-derive handles. |
+| `Dockerfile`, `entrypoint.sh` | Self-contained BlueZ for hosts without one. |
+
+## How this was reverse-engineered
+
+1. On an Android phone: Developer options → **Enable Bluetooth HCI snoop
+   log**. Then do a weigh-in with the Xiaomi Home app (ideally noting the
+   weight on the display), and pull `btsnoop_hci.log` off the phone
+   (`adb bugreport`, or it's under `/data/misc/bluetooth/logs`).
+2. `parse_btsnoop.py` extracts the ATT traffic for the scale's connection.
+   `decode_btsnoop.py` derives the session keys from the token and decrypts
+   everything.
+3. Decoding the payloads as MIoT operations (actions, results, events with
+   typed parameters) is what made the meaning of each exchange clear.
+   Replaying captured byte sequences without that structure led the first
+   version of this repo astray.
+
+**If a firmware update breaks something**, capture the app again and diff
+its decoded conversation against this README. HCI snoop logs contain
+everything else the phone's Bluetooth did during the capture (other
+devices, notification contents...), so don't publish them.
+
+## Open questions
+
+- **Stalled logins:** why roughly half the logins stalled without the app's
+  notification order and pause, or whether that's the real fix.
+- **Self-wake:** how often the scale wakes by itself while holding
+  weigh-ins, and for how long it keeps doing so.
+- **Clock after a battery change:** what timestamps the scale gives
+  weigh-ins before the first profile push sets its clock.
+  `scale_reader.py` replaces implausible ones with the current time.
+- **Event 5.3 p1:** always 0 so far.
+- **Other units:** `unit` values for lb/jin, and whether weights are then
+  still in 1/100 kg.
+- **Multiple users:** `uc`/`ud` with more than one user.
+- **Memory capacity:** at least 18 weigh-ins were seen stored at once.
+- **The other characteristic:** before login, the app also runs a short
+  exchange on another characteristic (handle `0x0025` for the phone). It
+  returns chip info such as `nrf52840`. Skipping it made no difference.
+
+## Corrections to the first version
+
+The first version of this repo (September 18) replayed captured bytes
+without understanding them, and got these wrong:
+
+- **Its "status probe" was *fetch stored weigh-ins*** (action 6.1), and **its
+  "property subscribe `1,2,…,9`" was *delete stored weigh-ins #1–9***
+  (action 6.2). That old script deleted a new scale's first nine weigh-ins
+  on every connection.
+- **The framed transfer was acknowledged per parcel.** The protocol uses one
+  "ready" and one "received" per value. Nor did the old script ever collect
+  the stored weigh-ins.
+- **"The MTU trap"**: whether the scale sends direct or framed depends on
+  the `a4` probe and the size of the value, not on ATT MTU negotiation.
+- **The undecoded "third notification shape" (`03 00…`, `04 00…`)** was
+  just parcels 3, 4, ... of a framed transfer. The "bad CCM tag" warnings
+  were framed headers mistaken for encrypted messages.
+- **Body composition** isn't in the protocol at all.
+- **Battery advice:** scanning doesn't wake the scale, connecting does. The
+  old reconnect loop is what kept it awake.
+
+## Related
+
+- [xpenology-bt-epyc7002](https://github.com/faraga1/xpenology-bt-epyc7002):
+  Bluetooth kernel modules for Xpenology, which this ran on.
+- [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor):
+  getting the token.
+- [opravdin/hass-yunmi-kettle-ble `PROTOCOL.md`](https://github.com/opravdin/hass-yunmi-kettle-ble):
+  the same miauth scheme on a kettle, which was a useful cross-reference for
+  the login.
+
+## License
+
+MIT (see `LICENSE`).
