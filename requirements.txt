@@ -1,3 +1,6 @@
-bleak
-cryptography
-httpx
+# Pinned to the versions this was verified with against a real scale. The
+# bleak BlueZ backend in particular changes between releases.
+bleak==3.0.2
+dbus-fast==5.0.22; sys_platform == "linux"
+cryptography==50.0.1
+httpx==0.28.1
