@@ -21,6 +21,29 @@ isn't known. This README replaces an earlier version that got several key
 things wrong. See [corrections](#corrections-to-the-first-version) if
 you used that code.
 
+## Which S200 do you have?
+
+**Not every S200 needs this.** Some variants broadcast their weight in
+their Bluetooth advertisements, and Home Assistant's `xiaomi-ble` reads
+those passively, since release 2026.1. Check the product id: bytes 3–4
+of the advertisement's service data for UUID `0xfe95`, little-endian. Any
+BLE scanner app shows them; e.g. `10 59 cb 4d …` is product id `0x4dcb`.
+
+| Product id | Weight in advertisements? | Use |
+|---|---|---|
+| `0x4c04` | Yes: encrypted MiBeacon object `0x4e16` (weight, profile id, timestamp), readable with the **BLE KEY** | Home Assistant's [Xiaomi BLE](https://www.home-assistant.io/integrations/xiaomi_ble/) integration; no connection needed |
+| `0x4dcb` | **No**, never, not even encrypted | This repo (authenticated connection with the **TOKEN**) |
+| `0x45c9` | Unknown (listed in `xiaomi-ble`) | Try Home Assistant first |
+
+The `0x4c04` row comes from the test data in
+[`xiaomi-ble`](https://github.com/Bluetooth-Devices/xiaomi-ble). The
+`0x4dcb` row matches this repo's scale and another owner's black/grey
+`xiaomi.scales.ms113` in
+[xiaomi-ble #263](https://github.com/Bluetooth-Devices/xiaomi-ble/issues/263),
+which Home Assistant never discovers. Both of those run firmware
+`2.1.2_0008.0010`, so the difference seems to be the hardware variant, not
+the firmware.
+
 ## The short version
 
 For anyone implementing their own client (Home Assistant, ESPHome, a phone
@@ -155,9 +178,20 @@ Service data for UUID `0xfe95`: `10 59 cb 4d NN <MAC, reversed>`.
 | MAC | little-endian |
 
 The scan response carries the name `Xiaomi Scale S200 XXXX` (the last four
-hex digits of the MAC). No object ever appears: no weight, not even
-encrypted. Tooling that decodes MiBeacon objects (e.g. Home Assistant's
-`xiaomi-ble`) can't read this scale.
+hex digits of the MAC). On this `0x4dcb` variant no object ever appears:
+no weight, not even encrypted. Tooling that decodes MiBeacon objects
+(e.g. Home Assistant's `xiaomi-ble`) can't read it (see
+[Which S200 do you have?](#which-s200-do-you-have)).
+
+**The frame control changes with the scale's state**, and the scale
+broadcasts while idle too, at least some of the time. The author of
+[esp32-mirror-weight-tracker](https://github.com/kfirmaymon84/esp32-mirror-weight-tracker)
+(another S200 client) found it flips from `0x5830` when idle to `0x5b10`
+(bit 9 set) when someone steps on, and only connects on the latter. The
+scale this repo was developed on showed `0x5910` in phone captures, taken
+right around connections. `scale_reader.py` logs every change of frame
+control and counter, so its logs will show the pattern for your unit. It
+doesn't act on the frame control (yet).
 
 ### GATT
 
@@ -425,6 +459,16 @@ without understanding them, and got these wrong:
 - [opravdin/hass-yunmi-kettle-ble `PROTOCOL.md`](https://github.com/opravdin/hass-yunmi-kettle-ble):
   the same miauth scheme on a kettle, which was a useful cross-reference for
   the login.
+- [kfirmaymon84/esp32-mirror-weight-tracker](https://github.com/kfirmaymon84/esp32-mirror-weight-tracker):
+  an ESP32 client for the S200 (live weights only, on a bathroom-mirror
+  display). It arrived at the same login independently, and is the source
+  of the idle/active frame-control observation.
+- [nokistin/xiaomi-s400-live](https://github.com/nokistin/xiaomi-s400-live)
+  and [1260er/ScaleLauncher](https://github.com/1260er/ScaleLauncher): the
+  same protocol on the S400 body-composition scale, with live weight and
+  impedance.
+- [dnandha/miauth](https://github.com/dnandha/miauth): the original
+  reverse engineering of this login scheme (on Xiaomi scooters).
 
 ## License
 
