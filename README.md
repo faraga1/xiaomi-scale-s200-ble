@@ -123,15 +123,15 @@ still unclear.
   Stored weigh-ins survived 10 days without batteries.
 - **Self-wake:** once, the scale fell asleep while holding an uncollected
   weigh-in, then advertised again ~3 minutes later with nobody near it. It
-  was also seen advertising with an empty memory and nobody on it. When and
-  why it wakes up by itself isn't understood.
+  was also seen advertising with an empty memory, with nobody near it and no
+  app in use. So it does wake up by itself; when and why isn't understood.
 - **MiBeacon frame counter** (in the advertisement): +1 for every weigh-in
   stored in memory (4 of 4 observed: 0 → 6 → 7 → 8, in step with stored
   records). A weigh-in a client claims live (action 4.3) isn't stored, and
   doesn't count. It restarts at 0 when the batteries go in. It was also
-  seen going up by 4 within 3 hours without any stored weigh-in, so
-  something else moves it too (an aborted weigh-in? the scale being
-  moved?).
+  seen going up by 4 within 3 hours without any stored weigh-in, while
+  nobody touched the scale and no app was used. So the scale also moves it
+  by itself, for reasons unknown.
 - **Clock:** set by the `"time"` field of the profile push (action 7.1).
   Record timestamps are UTC unix time.
 - **User recognition:** a stored weigh-in has flag `0` plus the member id if
