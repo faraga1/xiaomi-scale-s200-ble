@@ -49,6 +49,14 @@ in. It was also seen going up without a stored weigh-in (+4 in 3 hours), so
 something else moves it too. Such a change costs one fruitless sync, and a
 counter that keeps moving like that gets ignored for an hour.
 
+The scale also advertises while idle, at least some of the time. Another
+S200 owner (github.com/kfirmaymon84/esp32-mirror-weight-tracker) found the
+MiBeacon frame control -- the first two bytes of the service data -- flips
+from 0x5830 when idle to 0x5b10 (bit 9 set) when someone steps on. The unit
+this was developed on showed 0x5910 in phone captures. Not used for any
+decision here: every change of frame control or counter is logged
+("advertisement changed"), to learn the pattern first.
+
 ## Protocol
 
 Decoded from HCI snoop captures of the Xiaomi Home app (decode_btsnoop.py
@@ -800,11 +808,21 @@ def beacon_counter(adv) -> int | None:
     return beacon[4] if len(beacon) > 4 else None
 
 
+def beacon_frame_control(adv) -> int | None:
+    """The MiBeacon frame control (first two bytes of the 0xfe95 service
+    data, little-endian); its flag bits change with the scale's state."""
+    beacon = adv.service_data.get(MIBEACON_UUID, b"") if adv is not None else b""
+    return int.from_bytes(beacon[:2], "little") if len(beacon) >= 2 else None
+
+
 def describe_adv(adv) -> str:
     if adv is None:
         return "no advertisement data"
-    counter = beacon_counter(adv)
-    return f"RSSI {adv.rssi}, MiBeacon frame counter {'?' if counter is None else f'{counter:#04x}'}"
+    fc, counter = beacon_frame_control(adv), beacon_counter(adv)
+    return (
+        f"RSSI {adv.rssi}, MiBeacon frame control {'?' if fc is None else f'{fc:#06x}'}, "
+        f"frame counter {'?' if counter is None else f'{counter:#04x}'}"
+    )
 
 
 async def sync_wakeup(device, reader: Reader) -> int | None:
@@ -848,6 +866,7 @@ async def main():
         ignore_counter_until = 0.0
         last_seen = None
         advertising = False  # for the log only
+        last_beacon = None  # (frame control, counter) last seen, for the log only
         scan_failures = 0
         while True:
             try:
@@ -871,9 +890,13 @@ async def main():
                     log.info("scale not seen for %ds (asleep or out of range)", PRESENCE_GAP_S)
                     advertising = False
                 continue
+            beacon = (beacon_frame_control(adv), beacon_counter(adv))
             if not advertising:
                 log.info("scale advertising (%s)", describe_adv(adv))
                 advertising = True
+            elif beacon != last_beacon:
+                log.info("advertisement changed (%s)", describe_adv(adv))
+            last_beacon = beacon
             last_seen = now
 
             counter = beacon_counter(adv)

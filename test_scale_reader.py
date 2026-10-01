@@ -448,8 +448,8 @@ class SessionTests(ScannerTestCase):
         self.assertEqual(len(api.entries), 1)
 
 
-def adv(counter):
-    beacon = bytes.fromhex("1059cb4d") + bytes([counter]) + bytes.fromhex("ffeeddccbbaa")
+def adv(counter, frame_control=0x5910):
+    beacon = frame_control.to_bytes(2, "little") + bytes.fromhex("cb4d") + bytes([counter]) + bytes.fromhex("ffeeddccbbaa")
     return SimpleNamespace(rssi=-60, service_data={scale_reader.MIBEACON_UUID: beacon})
 
 
@@ -485,6 +485,18 @@ class WakeUpPolicyTests(ScannerTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await scale_reader.main()
         return len(syncs)
+
+    def test_describes_advertisement(self):
+        a = adv(0x0D, frame_control=0x5B10)
+        self.assertEqual((scale_reader.beacon_frame_control(a), scale_reader.beacon_counter(a)), (0x5B10, 0x0D))
+        self.assertEqual(scale_reader.describe_adv(a), "RSSI -60, MiBeacon frame control 0x5b10, frame counter 0x0d")
+
+    async def test_logs_advertisement_changes(self):
+        with self.assertLogs(scale_reader.log, "INFO") as logs:
+            await self.run_main([3, 3, 3, 4, 4])
+        changes = [line for line in logs.output if "advertisement changed" in line]
+        self.assertEqual(len(changes), 1)
+        self.assertIn("frame counter 0x04", changes[0])
 
     async def test_reappearing_without_a_new_weigh_in_doesnt_connect(self):
         # 2026-09-30 23:20: at -80 dBm the reader kept missing the scale's
