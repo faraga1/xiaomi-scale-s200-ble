@@ -11,7 +11,10 @@ Bluetooth LE without the Xiaomi Home app or the cloud. It contains:
 
 **Status:** verified against one real scale (firmware `2.1.2_0008.0010`) in
 September 2026: the client collected weigh-ins both live and from the
-scale's memory, including ones stored while it was out of range.
+scale's memory, including ones stored while it was out of range. The
+connect policy described under [Designing a client](#designing-a-client)
+replaced an earlier one on 2026-10-01, after that one looped at a weak
+signal; it hasn't been through a real weigh-in yet.
 There's no official documentation for this protocol; everything here was
 reverse-engineered, and the [open questions](#open-questions) list what
 isn't known. This README replaces an earlier version that got several key
@@ -32,12 +35,15 @@ app...), these are the facts that matter:
    weighs themselves. Fetch the stored weigh-ins later (action 6.1), then
    delete them (action 6.2).
 3. **The advertisements tell you when there's something new.** The MiBeacon
-   frame counter counts weigh-ins stored since the batteries went in. So a
-   passive listener knows when to connect.
-4. **A connection keeps the scale awake.** Never poll-connect: a client that
-   reconnects whenever it sees the scale keeps it awake forever, and flattens
-   the batteries. Connect once per wake-up, and disconnect as soon as nobody
-   is on the scale.
+   frame counter goes up by one for every weigh-in the scale stores. So a
+   passive listener knows when to connect, without connecting.
+4. **A connection keeps the scale awake.** Never poll-connect: a client
+   that reconnects whenever it sees the scale keeps it awake forever, and
+   flattens the batteries. **Connect only when the counter says there's
+   something new**, not when the scale "reappears". At a weak signal,
+   advertisements go missing for 10 s at a time while the scale is awake,
+   and "reconnect when it reappears" becomes the same keep-awake loop.
+   Disconnect as soon as nobody is on the scale.
 5. **Values can arrive in pieces.** Anything bigger than one BLE write
    (e.g. a list of stored weigh-ins) arrives as a *framed*, multi-parcel
    transfer. The receiver acknowledges it once before and once after all
@@ -115,13 +121,17 @@ still unclear.
 - **Memory:** every finished weigh-in is stored with a record number (which
   keeps counting up, even across battery changes) and a unix timestamp.
   Stored weigh-ins survived 10 days without batteries.
-- **Self-wake:** while it holds uncollected weigh-ins, it wakes up by itself
-  to offer them. Once, it woke ~3 minutes after falling asleep, with nobody
-  near it. It was never seen waking by itself with an empty memory.
-- **MiBeacon frame counter** (in the advertisement): the number of weigh-ins
-  stored since the batteries went in, mod 256. It went 0 → 6 → 7 → 8 in step
-  with stored records. A weigh-in a client claims live (action 4.3) isn't
-  stored, and doesn't count.
+- **Self-wake:** once, the scale fell asleep while holding an uncollected
+  weigh-in, then advertised again ~3 minutes later with nobody near it. It
+  was also seen advertising with an empty memory and nobody on it. When and
+  why it wakes up by itself isn't understood.
+- **MiBeacon frame counter** (in the advertisement): +1 for every weigh-in
+  stored in memory (4 of 4 observed: 0 → 6 → 7 → 8, in step with stored
+  records). A weigh-in a client claims live (action 4.3) isn't stored, and
+  doesn't count. It restarts at 0 when the batteries go in. It was also
+  seen going up by 4 within 3 hours without any stored weigh-in, so
+  something else moves it too (an aborted weigh-in? the scale being
+  moved?).
 - **Clock:** set by the `"time"` field of the profile push (action 7.1).
   Record timestamps are UTC unix time.
 - **User recognition:** a stored weigh-in has flag `0` plus the member id if
@@ -303,24 +313,36 @@ independently of whatever request it's waiting on.
 
 ## Designing a client
 
-`scale_reader.py` does the following. It's the design that got the scale's
-battery use close to zero between weigh-ins:
+`scale_reader.py` does the following:
 
-1. **Only scan** (in 10 s windows) until the scale shows up after a full
-   window without it. That means it just woke up.
-2. **Connect once:** log in, push the profile (this sets the clock), fetch,
-   deliver and delete the stored weigh-ins.
-3. **Stay connected only while someone is using the scale.** Disconnect 5 s
+1. **Only scan.** Check the frame counter in the scale's advertisements
+   every ~2 s while it's advertising. Scanning doesn't keep anything
+   awake.
+2. **Connect only when the counter differs from what it should be after
+   the last sync.** That's the counter in the advertisement that
+   triggered the sync, plus any stored weigh-ins collected that are newer
+   than that advertisement. A finished weigh-in gets stored, and shows up
+   as a new counter value a few seconds later. The only other reasons to
+   connect: the first sighting after the client starts, and a daily
+   safety sync.
+3. **Sync:** log in, push the profile (this sets the clock), then fetch,
+   deliver and delete the stored weigh-ins. Retry a failed login up to 4
+   times.
+4. **Stay connected only while someone is using the scale.** Disconnect 5 s
    after syncing if there's no live weight, or 15 s after the last live
-   update. Then check the store once more.
-4. **Don't connect again until the scale has gone back to sleep.** The one
-   exception: the frame counter differs from what it should be after the
-   sync (the counter in the advertisement that triggered the sync, plus any
-   stored weigh-ins collected that are newer than it). That means another
-   weigh-in was stored. If a sync triggered by the counter finds nothing,
-   stop following the counter until the scale sleeps, so it can never turn
-   into a reconnect loop.
-5. **Retry a failed login up to 4 times** within the same wake-up.
+   update. Then check the store once more. If someone steps on again after
+   the disconnect, that weigh-in gets stored and moves the counter.
+5. **Never let it loop.**
+   - A sync that fails outright backs off (1 min, doubling to 30 min); the
+     weigh-ins stay on the scale until a sync succeeds.
+   - Counter changes that bring nothing new each cost one sync. After 3
+     within an hour, ignore the counter for an hour.
+
+What *not* to do: treat "not seen for a scan window" as asleep and the next
+sighting as a wake-up worth a connection. That's what this client did
+before. At −80 dBm it missed the scale's advertisements for 10 s at a time
+while the scale was awake, and connected ~20 times in 20 minutes without a
+single weigh-in. The connections kept the scale awake.
 
 ## Tools
 
@@ -355,8 +377,12 @@ devices, notification contents...), so don't publish them.
 
 - **Stalled logins:** why roughly half the logins stalled without the app's
   notification order and pause, or whether that's the real fix.
-- **Self-wake:** how often the scale wakes by itself while holding
-  weigh-ins, and for how long it keeps doing so.
+- **Self-wake:** when and why the scale wakes up by itself (see
+  [How the scale behaves](#how-the-scale-behaves)). `scale_reader.py` logs
+  when the scale starts and stops advertising, ignoring gaps under 60 s,
+  so its logs show the pattern over time.
+- **The frame counter's other increments:** what else, besides a stored
+  weigh-in, moves it.
 - **Clock after a battery change:** what timestamps the scale gives
   weigh-ins before the first profile push sets its clock.
   `scale_reader.py` replaces implausible ones with the current time.
