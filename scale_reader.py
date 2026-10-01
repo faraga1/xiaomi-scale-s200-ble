@@ -18,31 +18,36 @@ reference; this docstring is the short version the code is written against.
 - The scale keeps every weigh-in in its own memory, with its own unix
   timestamp, until a client deletes it. Catching a weigh-in live is a
   nice-to-have, not a requirement: any later connection can collect it.
-  While it holds uncollected weigh-ins, it also wakes up by itself every
-  few minutes to offer them.
 
-So this client never connects on a timer. It only scans (observing
-advertisements doesn't wake anything up), and connects when the scale
-wakes up:
+So this client never connects on a timer, and never just because the
+scale is advertising. It only scans (observing advertisements doesn't wake
+anything up), and connects when an advertisement says there's something
+new:
 
-  1. the scale starts advertising after a full scan window without it:
-     it just woke up (almost always: someone stepped on it)
+  1. the MiBeacon frame counter in the advertisement (byte 4 of the 0xfe95
+     service data) differs from what it was after the last sync. It goes
+     up by one for every weigh-in the scale puts in its memory, so a
+     weigh-in shows up a few seconds after it's finished. (Also: the first
+     sighting after starting, and a daily safety sync.)
   2. connect, log in, set the scale's clock, fetch all stored weigh-ins,
      deliver them with their own timestamps, delete them from the scale,
      then collect weigh-ins live while someone is using it, and disconnect
      as soon as it's quiet (a connection keeps the scale awake, and it
      falls asleep within seconds of the disconnect)
-  3. don't connect again until the scale has gone back to sleep (a full
-     scan window without an advertisement) -- unless the MiBeacon frame
-     counter in its advertisements shows that another weigh-in got stored
-     while it's still awake. A counter-triggered sync that finds nothing
-     new switches that off until the scale sleeps, so it can't turn into a
-     reconnect loop.
+  3. remember the counter, and don't connect again until it moves on.
 
-The MiBeacon frame counter (byte 4 of the 0xfe95 service data) counts the
-weigh-ins the scale has put in its memory since its batteries went in
-(mod 256). Weigh-ins a client claimed live don't count. Observed going
-0 -> 6 -> 7 -> 8 in step with stored records.
+The scale merely appearing is NOT a reason to connect. An earlier version
+treated a 10s scan window without the scale as "asleep" and the next
+sighting as "woke up, sync". At a weak signal (-80 dBm) advertisements go
+missing for 10s at a time while the scale is awake; every such gap meant a
+connection, which kept the scale awake -- about 20 connections in 20
+minutes, without a single weigh-in.
+
+Counter facts: +1 for every stored weigh-in (4 of 4 observed); a weigh-in
+a client claims live doesn't count; it restarts at 0 when the batteries go
+in. It was also seen going up without a stored weigh-in (+4 in 3 hours), so
+something else moves it too. Such a change costs one fruitless sync, and a
+counter that keeps moving like that gets ignored for an hour.
 
 ## Protocol
 
@@ -173,21 +178,32 @@ PROFILE_WEIGHT_KG = float(os.environ.get("XIAOMI_PROFILE_WEIGHT_KG", "80"))
 
 # --- Timing -------------------------------------------------------------------
 
-# One discovery window. The scale advertises every ~0.5s while awake, so a
-# whole window without a single advertisement means it's asleep.
+# One discovery window: find_scale() returns as soon as the scale is seen,
+# or after this long if it isn't.
 SCAN_WINDOW_S = 10
-# While the scale is awake but this wake-up has already been synced: how
-# long to wait between checks for a new stored weigh-in or for it having
-# gone back to sleep. Short, because without a connection the scale can
-# fall asleep ~15s after a weigh-in; checking doesn't connect.
+# While the scale is advertising: how long between checks of its MiBeacon
+# counter. Short, because without a connection the scale can fall asleep
+# ~15s after a weigh-in; checking doesn't connect.
 AWAKE_RECHECK_S = 2
+# Only for the log: how long the scale has to be unseen before that's
+# logged as "not advertising". (Not used for any decision -- at a weak
+# signal, gaps of 10s+ happen while the scale is awake.)
+PRESENCE_GAP_S = 60
 # Scan failures in a row (SCAN_RETRY_S apart) before exiting, so whatever
 # supervises this process (Docker, systemd) can restart it; see main().
 SCAN_RETRY_S = 5
 MAX_SCAN_FAILURES = 12
-# Safety valve: if the scale ever stays awake indefinitely, still sync
-# again after this long, so stored weigh-ins can't get stuck.
-RESYNC_WHILE_AWAKE_S = 3600
+# Safety net for anything the counter might not show: if the scale is
+# advertising and the last sync was this long ago, sync anyway.
+RESYNC_AFTER_S = 24 * 3600
+# After a sync that failed outright (e.g. a bad link): wait before trying
+# again, doubling per consecutive failure. The weigh-ins stay on the scale.
+FAILED_SYNC_BACKOFF_S = 60
+FAILED_SYNC_BACKOFF_MAX_S = 1800
+# Counter changes that brought nothing new: after this many within
+# FRUITLESS_WINDOW_S, ignore the counter for that long.
+MAX_FRUITLESS_SYNCS = 3
+FRUITLESS_WINDOW_S = 3600
 # Connection attempts per wake-up. Logins used to stall about half the
 # time (see ScaleLink.setup()); a failed attempt only costs a few seconds.
 SYNC_ATTEMPTS = 4
@@ -824,10 +840,14 @@ async def main():
     )
     async with httpx.AsyncClient(timeout=10) as http:
         reader = Reader(http)
-        synced = False  # this wake-up has been synced
-        last_sync = 0.0
-        expected = None  # MiBeacon frame counter if nothing new got stored since the last sync
-        follow_counter = True  # counter changes still look meaningful this wake-up
+        expected = None  # MiBeacon frame counter as of the last sync; None until there was one
+        last_sync = time.monotonic()
+        retry_at = 0.0  # after a failed sync: no new attempt before this
+        backoff = FAILED_SYNC_BACKOFF_S
+        fruitless: list[float] = []  # when counter-triggered syncs found nothing
+        ignore_counter_until = 0.0
+        last_seen = None
+        advertising = False  # for the log only
         scan_failures = 0
         while True:
             try:
@@ -845,21 +865,28 @@ async def main():
                 await asyncio.sleep(SCAN_RETRY_S)
                 continue
 
+            now = time.monotonic()
             if device is None:
-                if synced:
-                    log.info("scale is asleep again; the next wake-up will trigger a sync")
-                synced, expected, follow_counter = False, None, True
+                if advertising and now - last_seen >= PRESENCE_GAP_S:
+                    log.info("scale not seen for %ds (asleep or out of range)", PRESENCE_GAP_S)
+                    advertising = False
                 continue
+            if not advertising:
+                log.info("scale advertising (%s)", describe_adv(adv))
+                advertising = True
+            last_seen = now
 
             counter = beacon_counter(adv)
             by_counter = False
-            if not synced:
-                reason = f"scale woke up ({describe_adv(adv)})"
-            elif follow_counter and None not in (counter, expected) and counter != expected:
-                reason = f"MiBeacon frame counter is {counter:#04x} instead of {expected:#04x}, so a weigh-in got stored"
+            if now < retry_at:
+                reason = None
+            elif expected is None:
+                reason = f"first sighting since the reader started ({describe_adv(adv)})"
+            elif counter is not None and counter != expected and now >= ignore_counter_until:
+                reason = f"MiBeacon frame counter is {counter:#04x} instead of {expected:#04x}"
                 by_counter = True
-            elif time.monotonic() - last_sync >= RESYNC_WHILE_AWAKE_S:
-                reason = f"scale has stayed awake for {RESYNC_WHILE_AWAKE_S}s since the last sync"
+            elif now - last_sync >= RESYNC_AFTER_S:
+                reason = f"no sync in {RESYNC_AFTER_S // 3600}h"
             else:
                 reason = None
 
@@ -871,17 +898,31 @@ async def main():
             trigger_time = time.time()
             reader.stored_timestamps.clear()
             collected = await sync_wakeup(device, reader)
+            now = time.monotonic()
+            if collected is None:
+                log.info("sync failed; next attempt in %ds at the earliest", backoff)
+                retry_at = now + backoff
+                backoff = min(backoff * 2, FAILED_SYNC_BACKOFF_MAX_S)
+                continue
+            backoff = FAILED_SYNC_BACKOFF_S
+            last_sync = now
+
             if by_counter and collected == 0:
-                log.info("nothing new after the counter change; ignoring counter changes until the scale sleeps")
-                follow_counter = False
+                fruitless = [t for t in fruitless if now - t < FRUITLESS_WINDOW_S] + [now]
+                if len(fruitless) >= MAX_FRUITLESS_SYNCS:
+                    log.warning(
+                        "%d counter changes in a row brought nothing new; ignoring the counter for %ds",
+                        len(fruitless), FRUITLESS_WINDOW_S,
+                    )
+                    ignore_counter_until = now + FRUITLESS_WINDOW_S
+                    fruitless = []
             # The advertisement that triggered this sync already counted the
             # weigh-ins stored before it; ones stored while we were
             # connecting were collected too, and moved the counter on.
             if counter is not None:
                 later = sum(1 for ts in reader.stored_timestamps if ts > trigger_time)
                 expected = (counter + later) % 256
-                log.info("synced; expecting MiBeacon frame counter %#04x while the scale stays awake", expected)
-            synced, last_sync = True, time.monotonic()
+                log.info("synced; next sync when the MiBeacon frame counter moves on from %#04x", expected)
 
 
 if __name__ == "__main__":

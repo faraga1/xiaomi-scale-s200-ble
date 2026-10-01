@@ -486,29 +486,42 @@ class WakeUpPolicyTests(ScannerTestCase):
                 await scale_reader.main()
         return len(syncs)
 
-    async def test_one_sync_per_wake_up(self):
-        self.assertEqual(await self.run_main([3] * 30), 1)
-        self.assertEqual(await self.run_main([None, 3, 3, 3, None, None, 4, 4]), 2)
+    async def test_reappearing_without_a_new_weigh_in_doesnt_connect(self):
+        # 2026-09-30 23:20: at -80 dBm the reader kept missing the scale's
+        # advertisements for 10s at a time, took every gap for "asleep" and
+        # every next sighting for "woke up" -- about 20 connections in 20
+        # minutes, which kept the scale awake.
+        self.assertEqual(await self.run_main([0x0D, None, 0x0D, None, None, 0x0D, 0x0D, None, 0x0D]), 1)
 
-    async def test_counter_change_while_awake_syncs_again(self):
-        # wake-up sync at counter 3, then two more weigh-ins get stored
-        self.assertEqual(await self.run_main([3, 3, 3, 4, 4, 4, 5, 5]), 3)
+    async def test_counter_change_syncs_again(self):
+        self.assertEqual(await self.run_main([3, 3, 4, 4, None, 5, 5]), 3)
 
     async def test_weigh_in_stored_right_after_a_sync_is_noticed(self):
-        # 2026-09-30: the very first sighting after a session already showed
-        # the next weigh-in, and taking that as the baseline missed it.
+        # The very first sighting after a session can already show it.
         self.assertEqual(await self.run_main([7, 8, 8]), 2)
 
     async def test_weigh_in_stored_while_connecting_is_not_a_new_one(self):
-        # Woke at counter 3; the weigh-in finished (stored, counter 4) before
+        # Seen at counter 3; the weigh-in finished (stored, counter 4) before
         # the login, and the sync collected it -- 4 is expected afterwards.
         self.assertEqual(await self.run_main([3, 4, 4, 4], stored_while_connecting=[1]), 1)
 
-    async def test_fruitless_counter_sync_stops_following_counter(self):
-        # The second (counter-triggered) sync finds nothing: further counter
-        # changes in the same wake-up are ignored, until the scale sleeps.
-        sightings = [3, 3, 4, 4, 5, 6, 7, None, 8, 8, 9]
-        self.assertEqual(await self.run_main(sightings, collected=[1, 0, 1, 1]), 4)
+    async def test_battery_change_resets_the_counter(self):
+        self.assertEqual(await self.run_main([0x0D, None, 0x00, 0x00]), 2)
+
+    async def test_counter_that_keeps_moving_for_nothing_gets_ignored(self):
+        # It also moves without a stored weigh-in (+4 in 3h on 2026-09-30).
+        # Each such change costs one sync, until MAX_FRUITLESS_SYNCS.
+        self.assertEqual(await self.run_main(list(range(10)), collected=[1] + [0] * 9), 1 + 3)
+
+    async def test_failed_sync_backs_off(self):
+        with mock.patch.object(scale_reader, "FAILED_SYNC_BACKOFF_S", 3600):
+            self.assertEqual(await self.run_main([3, 3, 3, 3], collected=[None]), 1)
+        with mock.patch.object(scale_reader, "FAILED_SYNC_BACKOFF_S", 0):
+            self.assertEqual(await self.run_main([3, 3, 3, 3], collected=[None, None, 1]), 3)
+
+    async def test_daily_safety_sync(self):
+        with mock.patch.object(scale_reader, "RESYNC_AFTER_S", 0):
+            self.assertEqual(await self.run_main([3] * 3), 3)
 
     async def test_exits_when_scanning_keeps_failing(self):
         # e.g. the adapter vanished: exit so Docker restarts the container
@@ -523,10 +536,6 @@ class WakeUpPolicyTests(ScannerTestCase):
         ):
             with self.assertRaises(SystemExit):
                 await scale_reader.main()
-
-    async def test_resync_if_scale_never_sleeps(self):
-        with mock.patch.object(scale_reader, "RESYNC_WHILE_AWAKE_S", 0):
-            self.assertEqual(await self.run_main([3] * 3), 3)
 
 
 if __name__ == "__main__":
