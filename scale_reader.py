@@ -1,66 +1,92 @@
 """
 Sync client for the Xiaomi Smart Scale S200 (MiBeacon product id 0x4dcb).
 
-Collects every weigh-in from the scale over Bluetooth LE -- no Xiaomi Home
-app, no cloud -- and hands each one (weight plus the scale's own timestamp)
-to a webhook, or prints it as a JSON line. README.md is the full protocol
-reference; this docstring is the short version the code is written against.
-
 ## How the scale behaves, and why this client is shaped around it
 
 - The scale is asleep almost all the time: not advertising, not
   connectable. Stepping on it wakes it up; it advertises (~every 0.5s)
   for a while and then goes back to sleep. A BLE connection counts as
   activity and keeps it awake -- so a client that connects whenever it can
-  see the scale never lets it sleep. (An earlier version of this client
-  did exactly that; the display kept flickering on and off until the
-  batteries were pulled.)
+  see the scale never lets it sleep. The previous version of this file did
+  exactly that (211 connections in ~2 hours on 2026-09-20, until the
+  batteries were pulled).
 - The scale keeps every weigh-in in its own memory, with its own unix
   timestamp, until a client deletes it. Catching a weigh-in live is a
   nice-to-have, not a requirement: any later connection can collect it.
 
-So this client never connects on a timer, and never just because the
-scale is advertising. It only scans (observing advertisements doesn't wake
+So this client never connects on a timer, and never because the scale
+merely shows up. It only scans (observing advertisements doesn't wake
 anything up), and connects when an advertisement says there's something
 new:
 
   1. the MiBeacon frame counter in the advertisement (byte 4 of the 0xfe95
      service data) differs from what it was after the last sync. It goes
      up by one for every weigh-in the scale puts in its memory, so a
-     weigh-in shows up a few seconds after it's finished. (Also: the first
-     sighting after starting, and a daily safety sync.)
+     weigh-in shows up a few seconds after it's finished.
   2. connect, log in, set the scale's clock, fetch all stored weigh-ins,
-     deliver them with their own timestamps, delete them from the scale,
-     then collect weigh-ins live while someone is using it, and disconnect
-     as soon as it's quiet (a connection keeps the scale awake, and it
-     falls asleep within seconds of the disconnect)
+     deliver them with their own timestamps, delete them from
+     the scale, then collect weigh-ins live while someone is using it, and
+     disconnect as soon as it's quiet (a connection keeps the scale awake,
+     and it falls asleep within seconds of the disconnect)
   3. remember the counter, and don't connect again until it moves on.
 
-The scale merely appearing is NOT a reason to connect. An earlier version
-treated a 10s scan window without the scale as "asleep" and the next
-sighting as "woke up, sync". At a weak signal (-80 dBm) advertisements go
-missing for 10s at a time while the scale is awake; every such gap meant a
-connection, which kept the scale awake -- about 20 connections in 20
-minutes, without a single weigh-in.
+The scale merely appearing is NOT a reason to connect. That was the
+design until 2026-10-01: a full scan window without the scale counted as
+"asleep", the next sighting as "woke up, sync". At the scale's final spot
+(-80 dBm) the reader regularly missed its advertisements for 10s while it
+was awake; every such gap meant another connection, which kept the scale
+awake -- about 20 connections in 20 minutes on 2026-09-30, with no
+weigh-in, until the batteries were pulled.
 
 Counter facts: +1 for every stored weigh-in (4 of 4 observed); a weigh-in
 a client claims live doesn't count; it restarts at 0 when the batteries go
-in. It was also seen going up without a stored weigh-in (+4 in 3 hours), so
-something else moves it too. Such a change costs one fruitless sync, and a
+in. It also went up by 4 between 2026-09-30 20:41 and 23:20 CEST without
+any stored weigh-in -- something else moves it too (an aborted weigh-in,
+the scale being moved?). Such a change costs one fruitless sync, and a
 counter that keeps moving like that gets ignored for an hour.
 
-The scale also advertises while idle, at least some of the time. Another
-S200 owner (github.com/kfirmaymon84/esp32-mirror-weight-tracker) found the
-MiBeacon frame control -- the first two bytes of the service data -- flips
-from 0x5830 when idle to 0x5b10 (bit 9 set) when someone steps on. The unit
-this was developed on showed 0x5910 in phone captures. Not used for any
-decision here: every change of frame control or counter is logged
-("advertisement changed"), to learn the pattern first.
+## Broadcasts (the main path when XIAOMI_BINDKEY is set)
+
+The scale broadcasts encrypted MiBeacon v5 objects (frame control bits
+0x08 encrypted + 0x40 object), readable with the BLE KEY ("bindkey"):
+  - 0x6623, 1 byte (0 so far), roughly every 50 minutes around the clock,
+    frame control 0x5958 (MAC included). Meaning unknown; this is what
+    moved the counter "by itself".
+  - right after a weigh-in, a frame with control 0x5948 (no MAC). On the
+    S200 variant Home Assistant's xiaomi-ble supports, that's object
+    0x4e16: <u8 profile id><u32 weight, 1/100 kg><u32 unix timestamp>.
+Decryption: AES-CCM, tag 4, key = bindkey, nonce = MAC (little-endian, from
+the frame or the configured one) + product id (2) + frame counter (1) +
+3-byte extended counter (payload[-7:-4]), associated data byte 0x11;
+payload = ciphertext + extended counter + tag. Objects: <u16 id><u8 len>
+<value>.
+Confirmed on this unit on 2026-10-07 (right weight and timestamp). So with
+a bindkey, weigh-ins come from the broadcast, and a connection is only
+attempted right after a weigh-in broadcast (at most once per
+SYNC_AFTER_WEIGH_IN_S, at most SYNC_ATTEMPTS tries): the scale is fully
+awake then, and collecting + deleting the weigh-in lets it sleep. Left
+uncollected, it kept advertising "connect to me" (frame control 0x5b10)
+for 5 minutes. The sync also sets the scale's clock (the broadcast
+timestamp comes from it) and collects anything the broadcasts missed.
+Never connect otherwise: ~40 attempts during the 50-minute broadcasts all
+failed on 2026-10-01/02, and the last one apparently left the scale stuck
+"connected" (solid Bluetooth icon, no broadcasts at all) for 4.5 days,
+until its batteries were pulled. The reader sends an alert (to NOTIFY_URL,
+or just the log) when the scale hasn't been heard for SILENT_ALERT_S.
+
+The scale also advertises while idle, at least some of the time.
+Another S200 owner (github.com/kfirmaymon84/esp32-mirror-weight-tracker)
+found the MiBeacon frame control -- the first two bytes of the service
+data -- flips from 0x5830 when idle to 0x5b10 (bit 9 set) when someone
+steps on, and only connects on the latter. This unit showed 0x5910 in
+both phone captures. Not used for any decision yet: every change of frame
+control or counter is logged ("advertisement changed"), to learn this
+unit's pattern first.
 
 ## Protocol
 
-Decoded from HCI snoop captures of the Xiaomi Home app (decode_btsnoop.py
-replays a capture through this file's own code).
+Everything below was decoded from HCI snoop captures of the Xiaomi Home
+app (decode_btsnoop.py replays a capture through this file's own code).
 
 Transport -- GATT service 0xfe95, characteristics by UUID16 (ATT handles
 differ between clients, so never hardcode those):
@@ -69,19 +95,19 @@ differ between clients, so never hardcode those):
     `00 00 02 <tag> <data>`   whole value in one write/notification
                               ("direct"); receiver answers `00 00 03 00`
     `00 00 00 <tag> <n_le16>` announces an n-parcel value ("framed");
-                              receiver answers `00 00 01 01` (ready) once,
-                              sender sends all n `<parcel_no_le16><chunk>`
-                              back to back, receiver answers `00 00 01 00`
-                              (received) once
-  The scale sends direct when a value fits in one write and framed when it
-  doesn't -- e.g. a long list of stored weigh-ins. The app, and this
-  client, always send framed.
+                              receiver answers `00 00 01 01` (ready),
+                              sender sends n x `<parcel_no_le16><chunk>`,
+                              receiver answers `00 00 01 00` (received)
+  The scale sends direct when a value fits in one notification and framed
+  when it doesn't -- e.g. a long list of stored weigh-ins. (Not handling
+  framed PROP values is why the previous version never saved anything:
+  the scale announced its stored weigh-ins in every session and the
+  client never answered.) The app, and this client, always send framed.
 
-Pre-login payload-size probe: write `a4` to LOGIN; the scale sends
-`00 00 04 00` + 2 bytes, then `00 00 04 01` + N bytes of 0xf2 on AUTH;
-echo each back with 04 -> 05. The big probe's length is the largest value
-the scale accepts in one write, and what it uses to decide direct vs
-framed. Skip the probe and it assumes 20 bytes: everything goes framed.
+Pre-login MTU probe: write `a4` to LOGIN; the scale sends `00 00 04 00`
++ 2 bytes, then `00 00 04 01` + N bytes of 0xf2 on AUTH; echo each back
+with 04 -> 05. The big probe's length is the largest value the scale
+accepts in one write.
 
 miauth login: write `24000000` to LOGIN; send rand_key (16 random bytes,
 tag 0x0b); receive remote_key (16 bytes, tag 0x0d) and remote_info (tag
@@ -163,6 +189,10 @@ WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
 # to keep using the Xiaomi Home app alongside this. They're then delivered
 # again on every sync, and the scale keeps waking up to offer them.
 KEEP_ON_SCALE = os.environ.get("KEEP_ON_SCALE", "") not in ("", "0", "false")
+# Optional: where to send alerts (POSTed as JSON {"title", "body"}, with the
+# WEBHOOK_TOKEN bearer if set), e.g. "the scale hasn't been heard for 12h".
+# Unset: alerts only go to the log.
+NOTIFY_URL = os.environ.get("NOTIFY_URL", "")
 
 # The miauth login secret: the "TOKEN" field from Xiaomi-cloud-tokens-
 # extractor (12 bytes / 24 hex chars), NOT its "BLE KEY"/bindkey field.
@@ -170,6 +200,13 @@ try:
     XIAOMI_TOKEN = bytes.fromhex(os.environ.get("XIAOMI_TOKEN", ""))
 except ValueError:
     XIAOMI_TOKEN = b""
+# The MiBeacon broadcast key: the "BLE KEY" field (16 bytes / 32 hex chars).
+# Optional: with it, weigh-ins are read from the scale's encrypted
+# broadcasts (see "Broadcasts" above); without it, only by connecting.
+try:
+    XIAOMI_BINDKEY = bytes.fromhex(os.environ.get("XIAOMI_BINDKEY", ""))
+except ValueError:
+    XIAOMI_BINDKEY = b""
 
 # The user profile sent to the scale on every connection (action 7.1). It
 # only affects the scale's own display and which member it attributes a
@@ -193,6 +230,18 @@ SCAN_WINDOW_S = 10
 # counter. Short, because without a connection the scale can fall asleep
 # ~15s after a weigh-in; checking doesn't connect.
 AWAKE_RECHECK_S = 2
+# The scale broadcasts something every ~50 minutes, day and night. Not
+# hearing it for this long means it's stuck, out of batteries or out of
+# range: push an alert to the user (once, until it's heard again).
+SILENT_ALERT_S = 12 * 3600
+NOTIFY_RETRY_S = 600  # if the backend couldn't be reached for the alert
+SILENT_TITLE = "Scale not heard"
+SILENT_BODY = (
+    "Nothing heard from the scale for {hours} hours. If its Bluetooth icon stays solid "
+    "when you step on, take the batteries out for 10 seconds."
+)
+BACK_TITLE = "Scale back"
+BACK_BODY = "The scale can be heard again; weigh-ins arrive automatically again."
 # Only for the log: how long the scale has to be unseen before that's
 # logged as "not advertising". (Not used for any decision -- at a weak
 # signal, gaps of 10s+ happen while the scale is awake.)
@@ -212,9 +261,13 @@ FAILED_SYNC_BACKOFF_MAX_S = 1800
 # FRUITLESS_WINDOW_S, ignore the counter for that long.
 MAX_FRUITLESS_SYNCS = 3
 FRUITLESS_WINDOW_S = 3600
-# Connection attempts per wake-up. Logins used to stall about half the
-# time (see ScaleLink.setup()); a failed attempt only costs a few seconds.
-SYNC_ATTEMPTS = 4
+# With XIAOMI_BINDKEY: connect right after a weigh-in broadcast, unless the
+# last connection attempt was less than this long ago (several step-ons in
+# a row: the broadcasts deliver each, one sync collects them).
+SYNC_AFTER_WEIGH_IN_S = 600
+# Connection attempts per sync. Kept low: each failed attempt risks leaving
+# the scale stuck "connected" (see the module docstring).
+SYNC_ATTEMPTS = 2
 STEP_TIMEOUT_S = 4  # any single reply in the login/framing layer
 RESULT_TIMEOUT_S = 6  # the result of an action
 RECORDS_TIMEOUT_S = 8  # the stored weigh-ins, after "fetch" reported a count
@@ -669,6 +722,21 @@ class Reader:
         log.info("delivered %.2f kg @ %s", w.weight_kg, recorded_at)
         return True
 
+    async def notify(self, title: str, body: str) -> bool:
+        """Send an alert to NOTIFY_URL, if set; otherwise just log it."""
+        if not NOTIFY_URL:
+            log.warning("ALERT: %s -- %s", title, body)
+            return True
+        headers = {"Authorization": f"Bearer {WEBHOOK_TOKEN}"} if WEBHOOK_TOKEN else {}
+        try:
+            resp = await self.http.post(NOTIFY_URL, headers=headers, json={"title": title, "body": body})
+            resp.raise_for_status()
+        except httpx.HTTPError as err:
+            log.error("failed to send alert %r: %s", title, err)
+            return False
+        log.info("sent alert %r", title)
+        return True
+
 
 async def sync_stored(link: ScaleLink, reader: Reader) -> int:
     """Collect, deliver and delete the scale's stored weigh-ins. Returns how
@@ -815,6 +883,64 @@ def beacon_frame_control(adv) -> int | None:
     return int.from_bytes(beacon[:2], "little") if len(beacon) >= 2 else None
 
 
+OBJ_WEIGH_IN = 0x4E16
+
+
+@dataclass
+class Beacon:
+    frame_control: int
+    counter: int
+    event: tuple  # identifies one broadcast: (frame counter, extended counter)
+    objects: list = field(default_factory=list)  # [(object id, value bytes)]
+
+
+def decode_beacon(adv) -> Beacon | None:
+    """Decode the MiBeacon service data, decrypting objects with
+    XIAOMI_BINDKEY. See "Broadcasts" in the module docstring."""
+    sd = adv.service_data.get(MIBEACON_UUID, b"") if adv is not None else b""
+    if len(sd) < 5:
+        return None
+    fc = int.from_bytes(sd[0:2], "little")
+    beacon = Beacon(fc, sd[4], (sd[4], None))
+    if not fc & 0x40:  # no object
+        return beacon
+    pos = 5
+    if fc & 0x10:
+        mac = sd[pos : pos + 6]
+        pos += 6
+    else:
+        mac = bytes.fromhex(XIAOMI_MAC.replace(":", ""))[::-1]
+    if fc & 0x20:  # capability byte, plus 2 bytes of IO capability if flagged
+        pos += 3 if sd[pos] & 0x20 else 1
+    payload = sd[pos:]
+    if fc & 0x08:
+        if not XIAOMI_BINDKEY or len(payload) < 8:
+            return beacon
+        ct, ext, tag = payload[:-7], payload[-7:-4], payload[-4:]
+        beacon.event = (sd[4], int.from_bytes(ext, "little"))
+        try:
+            payload = AESCCM(XIAOMI_BINDKEY, tag_length=4).decrypt(mac + sd[2:4] + sd[4:5] + ext, ct + tag, b"\x11")
+        except InvalidTag:
+            log.warning("could not decrypt a broadcast (wrong XIAOMI_BINDKEY?): %s", sd.hex())
+            return beacon
+    pos = 0
+    while pos + 3 <= len(payload):
+        length = payload[pos + 2]
+        beacon.objects.append((int.from_bytes(payload[pos : pos + 2], "little"), payload[pos + 3 : pos + 3 + length]))
+        pos += 3 + length
+    return beacon
+
+
+def parse_weigh_in_object(value: bytes) -> WeighIn | None:
+    """Object 0x4e16: <u8 profile id><u32 weight, 1/100 kg><u32 unix ts>."""
+    if len(value) != 9:
+        return None
+    _profile, weight, ts = struct.unpack("<BII", value)
+    if not 100 <= weight <= 30000:
+        return None
+    return WeighIn(weight / 100, ts)
+
+
 def describe_adv(adv) -> str:
     if adv is None:
         return "no advertisement data"
@@ -852,14 +978,23 @@ async def main():
             "XIAOMI_TOKEN must be 24 hex chars (the cloud 'TOKEN' field, not the 32-char BLE KEY/bindkey)"
         )
 
+    passive = bool(XIAOMI_BINDKEY)
     log.info(
-        "watching for %s; delivering to %s%s",
-        XIAOMI_MAC, WEBHOOK_URL or "stdout", " (keeping weigh-ins on the scale)" if KEEP_ON_SCALE else "",
+        "watching for %s; %s; delivering to %s%s",
+        XIAOMI_MAC,
+        "reading weigh-ins from its broadcasts" if passive else "no XIAOMI_BINDKEY, so connecting when its counter moves",
+        WEBHOOK_URL or "stdout", " (keeping weigh-ins on the scale)" if KEEP_ON_SCALE else "",
     )
     async with httpx.AsyncClient(timeout=10) as http:
         reader = Reader(http)
         expected = None  # MiBeacon frame counter as of the last sync; None until there was one
-        last_sync = time.monotonic()
+        started = time.monotonic()
+        last_sync = None  # last successful sync
+        last_attempt = None  # last sync attempt, successful or not
+        last_event = None  # the last broadcast event whose objects were handled
+        weigh_in_broadcast = False
+        silence_alerted = False
+        next_alert_try = 0.0
         retry_at = 0.0  # after a failed sync: no new attempt before this
         backoff = FAILED_SYNC_BACKOFF_S
         fruitless: list[float] = []  # when counter-triggered syncs found nothing
@@ -889,7 +1024,18 @@ async def main():
                 if advertising and now - last_seen >= PRESENCE_GAP_S:
                     log.info("scale not seen for %ds (asleep or out of range)", PRESENCE_GAP_S)
                     advertising = False
+                silent = now - (last_seen if last_seen is not None else started)
+                if not silence_alerted and silent >= SILENT_ALERT_S and now >= next_alert_try:
+                    log.warning("scale not heard for %.0fh; alerting the user", silent / 3600)
+                    if await reader.notify(SILENT_TITLE, SILENT_BODY.format(hours=int(silent // 3600))):
+                        silence_alerted = True
+                    else:
+                        next_alert_try = now + NOTIFY_RETRY_S
                 continue
+            if silence_alerted:
+                log.info("scale heard again after the silence alert")
+                await reader.notify(BACK_TITLE, BACK_BODY)
+                silence_alerted = False
             beacon = (beacon_frame_control(adv), beacon_counter(adv))
             if not advertising:
                 log.info("scale advertising (%s)", describe_adv(adv))
@@ -899,25 +1045,44 @@ async def main():
             last_beacon = beacon
             last_seen = now
 
+            if passive:
+                decoded = decode_beacon(adv)
+                if decoded is not None and decoded.objects and decoded.event != last_event:
+                    last_event = decoded.event
+                    for oid, value in decoded.objects:
+                        log.info("broadcast object %#06x: %s", oid, value.hex())
+                        w = parse_weigh_in_object(value) if oid == OBJ_WEIGH_IN else None
+                        if w is not None:
+                            log.info("weigh-in broadcast: %.2f kg, scale time %d", w.weight_kg, w.timestamp)
+                            if await reader.deliver(w):
+                                reader.note_weight(w)
+                            weigh_in_broadcast = True
+
             counter = beacon_counter(adv)
             by_counter = False
             if now < retry_at:
                 reason = None
+            elif passive:
+                reason = None
+                if weigh_in_broadcast and (last_attempt is None or now - last_attempt >= SYNC_AFTER_WEIGH_IN_S):
+                    reason = "weigh-in broadcast received, collecting it so the scale can sleep"
             elif expected is None:
                 reason = f"first sighting since the reader started ({describe_adv(adv)})"
             elif counter is not None and counter != expected and now >= ignore_counter_until:
                 reason = f"MiBeacon frame counter is {counter:#04x} instead of {expected:#04x}"
                 by_counter = True
-            elif now - last_sync >= RESYNC_AFTER_S:
+            elif now - (last_sync or started) >= RESYNC_AFTER_S:
                 reason = f"no sync in {RESYNC_AFTER_S // 3600}h"
             else:
                 reason = None
+            weigh_in_broadcast = False
 
             if reason is None:
                 await asyncio.sleep(AWAKE_RECHECK_S)
                 continue
 
             log.info("%s, syncing", reason)
+            last_attempt = now
             trigger_time = time.time()
             reader.stored_timestamps.clear()
             collected = await sync_wakeup(device, reader)

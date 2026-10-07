@@ -9,64 +9,75 @@ Bluetooth LE without the Xiaomi Home app or the cloud. It contains:
 - tools to decrypt your own captures, plus a simulated scale to develop
   against without owning one.
 
-**Status:** verified against one real scale (firmware `2.1.2_0008.0010`) in
-September 2026: the client collected weigh-ins both live and from the
-scale's memory, including ones stored while it was out of range. The
-connect policy described under [Designing a client](#designing-a-client)
-replaced an earlier one on 2026-10-01, after that one looped at a weak
-signal; it hasn't been through a real weigh-in yet.
+**Status:** verified against one real scale (firmware `2.1.2_0008.0010`),
+September–October 2026. The client has collected weigh-ins three ways:
+- from the scale's **encrypted broadcasts**, with no connection at all;
+- **live**, over a connection;
+- from the scale's **memory**, including weigh-ins stored while the
+  client was out of range.
 There's no official documentation for this protocol; everything here was
 reverse-engineered, and the [open questions](#open-questions) list what
 isn't known. This README replaces an earlier version that got several key
-things wrong. See [corrections](#corrections-to-the-first-version) if
+things wrong. See [corrections](#corrections) if
 you used that code.
 
-## Which S200 do you have?
+## Do you need this?
 
-**Not every S200 needs this.** Some variants broadcast their weight in
-their Bluetooth advertisements, and Home Assistant's `xiaomi-ble` reads
-those passively, since release 2026.1. Check the product id: bytes 3–4
-of the advertisement's service data for UUID `0xfe95`, little-endian. Any
-BLE scanner app shows them; e.g. `10 59 cb 4d …` is product id `0x4dcb`.
+**Every S200 seen so far broadcasts each weigh-in**, as an encrypted
+MiBeacon object `0x4e16` (weight, profile id, timestamp) that the
+**BLE KEY** decrypts. Home Assistant's
+[Xiaomi BLE](https://www.home-assistant.io/integrations/xiaomi_ble/)
+integration decodes exactly that, passively, since release 2026.1. If
+that works for you, you may not need anything else. This repo adds:
+- a standalone client that reads those broadcasts and delivers each
+  weigh-in to a webhook;
+- the authenticated connection (with the **TOKEN**): it collects
+  weigh-ins the broadcasts missed, sets the scale's clock, and clears its
+  memory so it can go back to sleep;
+- the full protocol, and what goes wrong in practice (a scale that gets
+  stuck, below).
 
-| Product id | Weight in advertisements? | Use |
+The product id is bytes 3–4 of the advertisement's service data for UUID
+`0xfe95`, little-endian; e.g. `10 59 cb 4d …` is `0x4dcb`. Any BLE scanner
+app shows it.
+
+| Product id | Weigh-in broadcast | Source |
 |---|---|---|
-| `0x4c04` | Yes: encrypted MiBeacon object `0x4e16` (weight, profile id, timestamp), readable with the **BLE KEY** | Home Assistant's [Xiaomi BLE](https://www.home-assistant.io/integrations/xiaomi_ble/) integration; no connection needed |
-| `0x4dcb` | **No**, never, not even encrypted | This repo (authenticated connection with the **TOKEN**) |
-| `0x45c9` | Unknown (listed in `xiaomi-ble`) | Try Home Assistant first |
+| `0x4c04` | Object `0x4e16` | [`xiaomi-ble`](https://github.com/Bluetooth-Devices/xiaomi-ble)'s test data |
+| `0x4dcb` | Object `0x4e16`, confirmed 2026-10-07 | This repo's scale (a black/grey `xiaomi.scales.ms113`) |
+| `0x45c9` | Unknown | Listed in `xiaomi-ble` |
 
-The `0x4c04` row comes from the test data in
-[`xiaomi-ble`](https://github.com/Bluetooth-Devices/xiaomi-ble). The
-`0x4dcb` row matches this repo's scale and another owner's black/grey
-`xiaomi.scales.ms113` in
-[xiaomi-ble #263](https://github.com/Bluetooth-Devices/xiaomi-ble/issues/263),
-which Home Assistant never discovers. Both of those run firmware
-`2.1.2_0008.0010`, so the difference seems to be the hardware variant, not
-the firmware.
+One `0x4dcb` owner reported that Home Assistant never discovers their
+scale ([xiaomi-ble #263](https://github.com/Bluetooth-Devices/xiaomi-ble/issues/263)).
+Why isn't known. This repo's own first conclusion, that `0x4dcb` never
+broadcasts its weight, was wrong; see [corrections](#corrections).
 
 ## The short version
 
 For anyone implementing their own client (Home Assistant, ESPHome, a phone
 app...), these are the facts that matter:
 
-1. **The weight is never broadcast.** Advertisements only carry a minimal
-   MiBeacon frame. You have to connect over GATT and log in with Xiaomi's
-   "miauth" scheme, using the device's cloud **TOKEN** (12 bytes). That's
-   not the "BLE KEY"/bindkey that other Xiaomi sensors use.
-2. **The scale keeps every weigh-in in memory** (weight + unix timestamp)
-   until a client deletes it. You don't need to be connected while someone
-   weighs themselves. Fetch the stored weigh-ins later (action 6.1), then
-   delete them (action 6.2).
-3. **The advertisements tell you when there's something new.** The MiBeacon
-   frame counter goes up by one for every weigh-in the scale stores. So a
-   passive listener knows when to connect, without connecting.
-4. **A connection keeps the scale awake.** Never poll-connect: a client
-   that reconnects whenever it sees the scale keeps it awake forever, and
-   flattens the batteries. **Connect only when the counter says there's
-   something new**, not when the scale "reappears". At a weak signal,
-   advertisements go missing for 10 s at a time while the scale is awake,
-   and "reconnect when it reappears" becomes the same keep-awake loop.
-   Disconnect as soon as nobody is on the scale.
+1. **Every weigh-in is broadcast, encrypted.** Right after a weigh-in, the
+   advertisement carries MiBeacon object `0x4e16`, encrypted with the
+   **BLE KEY** (bindkey). A listener gets the weight and timestamp without
+   connecting. See [Advertisement](#advertisement).
+2. **The scale also keeps every weigh-in in memory** (weight + unix
+   timestamp) until a client deletes it. Broadcasts can be missed; the
+   memory catches those. Getting at it needs a GATT connection and
+   Xiaomi's "miauth" login with the cloud **TOKEN** (12 bytes, a different
+   key from the BLE KEY). Fetch with action 6.1, delete with action 6.2.
+3. **A connection keeps the scale awake, and a failed one can get it
+   stuck.**
+   - Never poll-connect: a client that reconnects whenever it sees the
+     scale keeps it awake forever, and flattens the batteries.
+   - Connect only right after a weigh-in broadcast, when the scale is fully
+     awake. Collecting the weigh-in then lets it sleep; left uncollected,
+     it kept advertising "connect to me" for 5 minutes.
+   - Once, a connection attempt that timed out left the scale stuck
+     "connected" for 4.5 days: Bluetooth icon solid, no broadcasts at all,
+     and no weigh-ins stored. Only pulling the batteries fixed it.
+4. **The frame counter counts broadcast events, not weigh-ins.** That
+   includes a status broadcast the scale sends about every 50 minutes.
 5. **Values can arrive in pieces.** Anything bigger than one BLE write
    (e.g. a list of stored weigh-ins) arrives as a *framed*, multi-parcel
    transfer. The receiver acknowledges it once before and once after all
@@ -77,14 +88,16 @@ app...), these are the facts that matter:
 
 ## Quick start
 
-### 1. Get the token
+### 1. Get the keys
 
 Run [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor)
 against the Xiaomi account the scale is paired with. It prints two keys for
-the scale; you need **`TOKEN`** (24 hex characters). **`BLE KEY`** (32 hex
-characters) is the advertisement key and doesn't work for this. Mixing them
-up is the most common reason logins fail. You also need the scale's
-Bluetooth MAC address, which the extractor prints too.
+the scale, and you want both:
+- **`BLE KEY`** (32 hex characters) decrypts the broadcasts;
+- **`TOKEN`** (24 hex characters) is the login secret for connecting.
+
+Swapping them is the most common reason things fail. You also need the
+scale's Bluetooth MAC address, which the extractor prints too.
 
 ### 2. Run it
 
@@ -94,6 +107,7 @@ On a Linux machine with a working BlueZ (`bluetoothd`), run it directly:
 pip install -r requirements.txt
 export XIAOMI_MAC=AA:BB:CC:DD:EE:FF
 export XIAOMI_TOKEN=0123456789abcdef01234567
+export XIAOMI_BINDKEY=0123456789abcdef0123456789abcdef
 export WEBHOOK_URL=https://example.com/weigh-ins   # optional, see below
 python scale_reader.py
 ```
@@ -105,7 +119,7 @@ its own `dbus-daemon` + `bluetoothd`, so don't use it on a host whose own
 ```bash
 docker build -t s200 .
 docker run -d --name s200 --restart unless-stopped --net=host --privileged \
-  -e XIAOMI_MAC=... -e XIAOMI_TOKEN=... -e WEBHOOK_URL=... s200
+  -e XIAOMI_MAC=... -e XIAOMI_TOKEN=... -e XIAOMI_BINDKEY=... -e WEBHOOK_URL=... s200
 ```
 
 The kernel still needs Bluetooth support. Synology/Xpenology kernels don't
@@ -119,9 +133,11 @@ whenever `hci0` is missing.
 | Variable | |
 |---|---|
 | `XIAOMI_MAC` | Required. The scale's Bluetooth address. |
-| `XIAOMI_TOKEN` | Required. The cloud `TOKEN` (24 hex chars). |
+| `XIAOMI_TOKEN` | Required. The cloud `TOKEN` (24 hex chars), for connecting. |
+| `XIAOMI_BINDKEY` | Recommended. The `BLE KEY` (32 hex chars). With it, weigh-ins come from the broadcasts and the client only connects right after one. Without it, it falls back to connecting when the frame counter moves. |
 | `WEBHOOK_URL` | Where to POST each weigh-in as JSON: `{"weight_kg": 80.25, "recorded_at": "2026-09-30T07:15:42Z"}`. Unset: prints one JSON line per weigh-in to stdout. |
 | `WEBHOOK_TOKEN` | Optional. Sent as `Authorization: Bearer <token>`. |
+| `NOTIFY_URL` | Optional. Where to POST alerts as JSON `{"title", "body"}` (with the `WEBHOOK_TOKEN` bearer), e.g. "scale not heard for 12 hours". Unset: alerts only go to the log. |
 | `KEEP_ON_SCALE` | `1` = never delete or claim weigh-ins on the scale, e.g. to keep the Xiaomi Home app working alongside. They're then delivered again on every sync, and the scale keeps waking up to offer them. |
 | `XIAOMI_PROFILE_MEMBER_ID`, `_AGE`, `_SEX`, `_HEIGHT_CM`, `_WEIGHT_KG` | The user profile pushed to the scale (see [action 7.1](#services)). Only affects the scale's display and user recognition. If you also use the Xiaomi app, set the member id to your account's (the `mid` in the app's own profile push). |
 | `LOG_LEVEL` | `DEBUG` logs every raw BLE value. |
@@ -144,17 +160,25 @@ still unclear.
 - **Memory:** every finished weigh-in is stored with a record number (which
   keeps counting up, even across battery changes) and a unix timestamp.
   Stored weigh-ins survived 10 days without batteries.
-- **Self-wake:** once, the scale fell asleep while holding an uncollected
-  weigh-in, then advertised again ~3 minutes later with nobody near it. It
-  was also seen advertising with an empty memory, with nobody near it and no
-  app in use. So it does wake up by itself; when and why isn't understood.
-- **MiBeacon frame counter** (in the advertisement): +1 for every weigh-in
-  stored in memory (4 of 4 observed: 0 → 6 → 7 → 8, in step with stored
-  records). A weigh-in a client claims live (action 4.3) isn't stored, and
-  doesn't count. It restarts at 0 when the batteries go in. It was also
-  seen going up by 4 within 3 hours without any stored weigh-in, while
-  nobody touched the scale and no app was used. So the scale also moves it
-  by itself, for reasons unknown.
+- **Status broadcast:** about every 50 minutes, day and night, the scale
+  briefly broadcasts an encrypted object `0x6623` (1 byte, 0 so far; its
+  meaning is unknown).
+- **After a weigh-in:** it broadcasts the weigh-in (object `0x4e16`). If
+  no client collects it, it then advertises "connect to me" (frame control
+  `0x5b10`) for about 5 minutes before sleeping. When collected, it sleeps
+  within seconds.
+- **MiBeacon frame counter** (in the advertisement): goes up with every
+  broadcast event, the 50-minute status broadcasts included. It restarts
+  at 0 when the batteries go in. (Earlier it looked like it counted stored
+  weigh-ins: it went up in step with them, and the status broadcasts
+  explained the rest.)
+- **Stuck "connected":** after a connection attempt that timed out, the
+  scale once behaved as if still connected for 4.5 days. When stepped on,
+  its Bluetooth icon was solid instead of blinking; it sent no broadcasts at
+  all (not even the 50-minute ones); and it didn't store the weigh-ins made
+  in the meantime. Pulling the batteries for 10 s fixed it. So keep
+  connection attempts rare. If the scale stays silent for many hours,
+  suspect this (`scale_reader.py` alerts after 12 h).
 - **Clock:** set by the `"time"` field of the profile push (action 7.1).
   Record timestamps are UTC unix time.
 - **User recognition:** a stored weigh-in has flag `0` plus the member id if
@@ -168,30 +192,37 @@ still unclear.
 
 ### Advertisement
 
-Service data for UUID `0xfe95`: `10 59 cb 4d NN <MAC, reversed>`.
+Service data for UUID `0xfe95` (MiBeacon v5):
+`<frame control:le16> <product id:le16> <frame counter:u8> [MAC, reversed] [payload]`.
+The frame control says what follows:
 
-| Bytes | Meaning |
+| Frame control | Contents | When (this repo's `0x4dcb` scale) |
+|---|---|---|
+| `0x5910` | MAC, no object | Awake, e.g. after a connection |
+| `0x5b10` | MAC, no object; bit 9 set | Awake, wants a client ("connect to me"), e.g. while a weigh-in waits to be collected |
+| `0x5958` | MAC + encrypted object | Status object `0x6623`, every ~50 minutes |
+| `0x5948` | Encrypted object, no MAC | Weigh-in object `0x4e16`, right after a weigh-in |
+
+Bit `0x08` = encrypted, `0x10` = MAC included, `0x40` = object included.
+Another S200 client
+([esp32-mirror-weight-tracker](https://github.com/kfirmaymon84/esp32-mirror-weight-tracker))
+saw `0x5830` when idle and `0x5b10` when someone steps on.
+
+**Decrypting an object frame** (AES-CCM, 4-byte tag, key = BLE KEY):
+- the payload after the MAC (if any) is `<ciphertext> <extended counter:3> <tag:4>`;
+- nonce = MAC (little-endian, from the frame, or the scale's own if not
+  included) + product id (2) + frame counter (1) + extended counter (3);
+- associated data: the single byte `0x11`;
+- the plaintext is one or more objects `<id:le16> <length:u8> <value>`.
+
+| Object | Value |
 |---|---|
-| `10 59` | frame control `0x5910`: MiBeacon v5, bound, MAC included, no object, not encrypted |
-| `cb 4d` | product id `0x4dcb` |
-| `NN` | frame counter (stored weigh-ins since power-on) |
-| MAC | little-endian |
+| `0x4e16` | 9 bytes: `<profile id:u8> <weight:le32, 1/100 kg> <unix time:le32>`, e.g. `01 2f1c0000 803bb16a` = profile 1, 72.15 kg, 2026-09-21 14:13:20 UTC |
+| `0x6623` | 1 byte, `00` so far; meaning unknown |
 
-The scan response carries the name `Xiaomi Scale S200 XXXX` (the last four
-hex digits of the MAC). On this `0x4dcb` variant no object ever appears:
-no weight, not even encrypted. Tooling that decodes MiBeacon objects
-(e.g. Home Assistant's `xiaomi-ble`) can't read it (see
-[Which S200 do you have?](#which-s200-do-you-have)).
-
-**The frame control changes with the scale's state**, and the scale
-broadcasts while idle too, at least some of the time. The author of
-[esp32-mirror-weight-tracker](https://github.com/kfirmaymon84/esp32-mirror-weight-tracker)
-(another S200 client) found it flips from `0x5830` when idle to `0x5b10`
-(bit 9 set) when someone steps on, and only connects on the latter. The
-scale this repo was developed on showed `0x5910` in phone captures, taken
-right around connections. `scale_reader.py` logs every change of frame
-control and counter, so its logs will show the pattern for your unit. It
-doesn't act on the frame control (yet).
+The timestamp comes from the scale's clock, which is only set by a
+connection (the profile push, action 7.1). The scan response carries the
+name `Xiaomi Scale S200 XXXX` (the last four hex digits of the MAC).
 
 ### GATT
 
@@ -347,36 +378,39 @@ independently of whatever request it's waiting on.
 
 ## Designing a client
 
-`scale_reader.py` does the following:
+`scale_reader.py` does the following (with a BLE KEY):
 
-1. **Only scan.** Check the frame counter in the scale's advertisements
-   every ~2 s while it's advertising. Scanning doesn't keep anything
-   awake.
-2. **Connect only when the counter differs from what it should be after
-   the last sync.** That's the counter in the advertisement that
-   triggered the sync, plus any stored weigh-ins collected that are newer
-   than that advertisement. A finished weigh-in gets stored, and shows up
-   as a new counter value a few seconds later. The only other reasons to
-   connect: the first sighting after the client starts, and a daily
-   safety sync.
-3. **Sync:** log in, push the profile (this sets the clock), then fetch,
-   deliver and delete the stored weigh-ins. Retry a failed login up to 4
-   times.
-4. **Stay connected only while someone is using the scale.** Disconnect 5 s
-   after syncing if there's no live weight, or 15 s after the last live
-   update. Then check the store once more. If someone steps on again after
-   the disconnect, that weigh-in gets stored and moves the counter.
-5. **Never let it loop.**
-   - A sync that fails outright backs off (1 min, doubling to 30 min); the
-     weigh-ins stay on the scale until a sync succeeds.
-   - Counter changes that bring nothing new each cost one sync. After 3
-     within an hour, ignore the counter for an hour.
+1. **Only scan, and decrypt every advertisement.** Scanning doesn't keep
+   anything awake.
+2. **Weigh-in broadcast (`0x4e16`) → deliver it**, with the scale's
+   timestamp. One broadcast event (frame counter + extended counter) is
+   handled once, however often it's seen.
+3. **Right after a weigh-in broadcast, connect once.** At most once per
+   10 minutes, and at most 2 attempts. Log in, push the profile (this sets
+   the clock), fetch/deliver/delete the stored weigh-ins, listen briefly
+   for live weigh-ins, and disconnect. The scale is fully awake then,
+   which is when connections work, and collecting the weigh-in lets it
+   sleep. A failed attempt waits for the next weigh-in.
+4. **Never connect otherwise.** No timers, no catch-up syncs, nothing on
+   the 50-minute status broadcasts. Connection attempts during those all
+   failed, and one of them most likely left the scale stuck.
+5. **Alert when the scale goes silent** for 12 hours (normally there's a
+   broadcast every ~50 minutes). Once, until it's heard again.
 
-What *not* to do: treat "not seen for a scan window" as asleep and the next
-sighting as a wake-up worth a connection. That's what this client did
-before. At −80 dBm it missed the scale's advertisements for 10 s at a time
-while the scale was awake, and connected ~20 times in 20 minutes without a
-single weigh-in. The connections kept the scale awake.
+Without a BLE KEY it can't read the broadcasts, and connects when the frame
+counter differs from what it should be after the last sync. That's the
+counter in the advertisement that triggered the sync, plus any stored
+weigh-ins collected that are newer than it. Since the status broadcasts
+also move the counter, it ignores the counter for an hour after 3
+fruitless syncs. Failed syncs back off from 1 minute, doubling, up to 30.
+
+What *not* to do:
+- **Treat "not seen for a scan window" as asleep, and the next sighting as
+  a wake-up worth a connection.** At −80 dBm the scale's advertisements go
+  missing for 10 s at a time while it's awake. That rule connected ~20
+  times in 20 minutes without a single weigh-in, keeping the scale awake.
+- **Retry connections for as long as the scale is visible.** That's how it
+  got stuck.
 
 ## Tools
 
@@ -411,12 +445,9 @@ devices, notification contents...), so don't publish them.
 
 - **Stalled logins:** why roughly half the logins stalled without the app's
   notification order and pause, or whether that's the real fix.
-- **Self-wake:** when and why the scale wakes up by itself (see
-  [How the scale behaves](#how-the-scale-behaves)). `scale_reader.py` logs
-  when the scale starts and stops advertising, ignoring gaps under 60 s,
-  so its logs show the pattern over time.
-- **The frame counter's other increments:** what else, besides a stored
-  weigh-in, moves it.
+- **Object `0x6623`:** what the 50-minute status broadcast means.
+- **The stuck state:** exactly what triggers it, and whether the scale ever
+  recovers from it by itself.
 - **Clock after a battery change:** what timestamps the scale gives
   weigh-ins before the first profile push sets its clock.
   `scale_reader.py` replaces implausible ones with the current time.
@@ -429,10 +460,18 @@ devices, notification contents...), so don't publish them.
   exchange on another characteristic (handle `0x0025` for the phone). It
   returns chip info such as `nrf52840`. Skipping it made no difference.
 
-## Corrections to the first version
+## Corrections
 
-The first version of this repo (September 18) replayed captured bytes
-without understanding them, and got these wrong:
+**October 2026.** The September 30 rewrite of this README said the
+`0x4dcb` variant never broadcasts its weight, and that the frame counter
+counts stored weigh-ins. Both were wrong:
+- it broadcasts every weigh-in as object `0x4e16`, which the phone
+  captures behind that conclusion simply didn't contain;
+- the counter counts broadcast events, the 50-minute status broadcasts
+  included.
+
+**The first version of this repo (September 18)** replayed captured
+bytes without understanding them, and got these wrong:
 
 - **Its "status probe" was *fetch stored weigh-ins*** (action 6.1), and **its
   "property subscribe `1,2,…,9`" was *delete stored weigh-ins #1–9***

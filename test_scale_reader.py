@@ -20,6 +20,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from cryptography.hazmat.primitives.ciphers.aead import AESCCM
+
 import httpx
 
 import scale_reader
@@ -46,6 +48,7 @@ from scale_reader import (
 )
 
 TOKEN = bytes.fromhex("00112233445566778899aabb")
+BINDKEY = bytes.fromhex("00112233445566778899aabbccddeeff")
 
 
 def result(tid, *params):
@@ -282,12 +285,16 @@ class FakeBackendApi:
     def __init__(self, fail=False):
         self.fail = fail
         self.entries = []
+        self.notifications = []
 
     def handler(self, request):
         assert request.headers["Authorization"] == "Bearer test-token"
         if self.fail:
             return httpx.Response(500, json={"error": "down"})
         body = json.loads(request.content)
+        if request.url.path.endswith("/notify"):
+            self.notifications.append(body)
+            return httpx.Response(202, json={"push": True})
         if any(e["recorded_at"] == body["recorded_at"] and e["weight_kg"] == body["weight_kg"] for e in self.entries):
             return httpx.Response(200, json={**body, "duplicate": True})
         self.entries.append(body)
@@ -298,9 +305,11 @@ class ScannerTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         patches = {
             "XIAOMI_TOKEN": TOKEN,
+            "XIAOMI_BINDKEY": b"",
             "WEBHOOK_URL": "http://webhook.test/weigh-ins",
             "WEBHOOK_TOKEN": "test-token",
             "KEEP_ON_SCALE": False,
+            "NOTIFY_URL": "http://webhook.test/notify",
             "XIAOMI_MAC": "AA:BB:CC:DD:EE:FF",
             "BleakClient": FakeClient,
             "STEP_TIMEOUT_S": 0.5,
@@ -448,6 +457,26 @@ class SessionTests(ScannerTestCase):
         self.assertEqual(len(api.entries), 1)
 
 
+def broadcast(counter, objects, with_mac=True, ext=7, key=BINDKEY):
+    """An encrypted MiBeacon v5 advertisement carrying `objects`, the way the
+    scale sends them (frame control 0x5958 with MAC, 0x5948 without)."""
+    mac = bytes.fromhex("AABBCCDDEEFF")[::-1]
+    pid = bytes.fromhex("cb4d")
+    pt = b"".join(oid.to_bytes(2, "little") + bytes([len(v)]) + v for oid, v in objects)
+    ext_b = ext.to_bytes(3, "little")
+    sealed = AESCCM(key, tag_length=4).encrypt(mac + pid + bytes([counter]) + ext_b, pt, b"\x11")
+    fc = 0x5958 if with_mac else 0x5948
+    sd = fc.to_bytes(2, "little") + pid + bytes([counter]) + (mac if with_mac else b"") + sealed[:-4] + ext_b + sealed[-4:]
+    return SimpleNamespace(rssi=-80, service_data={scale_reader.MIBEACON_UUID: sd})
+
+
+def weigh_in_object(weight_raw, ts, profile=1):
+    return (0x4E16, struct.pack("<BII", profile, weight_raw, ts))
+
+
+HEARTBEAT = (0x6623, b"\x00")
+
+
 def adv(counter, frame_control=0x5910):
     beacon = frame_control.to_bytes(2, "little") + bytes.fromhex("cb4d") + bytes([counter]) + bytes.fromhex("ffeeddccbbaa")
     return SimpleNamespace(rssi=-60, service_data={scale_reader.MIBEACON_UUID: beacon})
@@ -467,10 +496,12 @@ class WakeUpPolicyTests(ScannerTestCase):
 
         async def fake_find_scale(timeout):
             try:
-                counter = next(script)
+                sighting = next(script)
             except StopIteration:
                 raise asyncio.CancelledError
-            return (None, None) if counter is None else (object(), adv(counter))
+            if sighting is None:
+                return None, None
+            return object(), (adv(sighting) if isinstance(sighting, int) else sighting)
 
         async def fake_sync(device, reader):
             syncs.append(device)
@@ -485,6 +516,21 @@ class WakeUpPolicyTests(ScannerTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await scale_reader.main()
         return len(syncs)
+
+    def test_decodes_encrypted_broadcasts(self):
+        with mock.patch.object(scale_reader, "XIAOMI_BINDKEY", BINDKEY):
+            for with_mac in (True, False):
+                b = scale_reader.decode_beacon(broadcast(5, [HEARTBEAT, weigh_in_object(7215, 1790000000)], with_mac=with_mac))
+                self.assertEqual(b.frame_control, 0x5958 if with_mac else 0x5948)
+                self.assertEqual(b.event, (5, 7))
+                self.assertEqual(b.objects, [HEARTBEAT, weigh_in_object(7215, 1790000000)])
+                w = scale_reader.parse_weigh_in_object(b.objects[1][1])
+                self.assertEqual((w.weight_kg, w.timestamp), (72.15, 1790000000))
+
+    def test_wrong_bindkey_yields_no_objects(self):
+        other = bytes.fromhex("ffeeddccbbaa99887766554433221100")
+        with mock.patch.object(scale_reader, "XIAOMI_BINDKEY", other), self.assertLogs(scale_reader.log, "WARNING"):
+            self.assertEqual(scale_reader.decode_beacon(broadcast(5, [HEARTBEAT])).objects, [])
 
     def test_describes_advertisement(self):
         a = adv(0x0D, frame_control=0x5B10)
@@ -534,6 +580,93 @@ class WakeUpPolicyTests(ScannerTestCase):
     async def test_daily_safety_sync(self):
         with mock.patch.object(scale_reader, "RESYNC_AFTER_S", 0):
             self.assertEqual(await self.run_main([3] * 3), 3)
+
+    async def run_passive(self, sightings, collected=()):
+        delivered = []
+
+        async def fake_deliver(reader, w):
+            delivered.append((w.weight_kg, w.timestamp))
+            return True
+
+        with (
+            mock.patch.object(scale_reader, "XIAOMI_BINDKEY", BINDKEY),
+            mock.patch.object(scale_reader.Reader, "deliver", fake_deliver),
+        ):
+            syncs = await self.run_main(sightings, collected)
+        return syncs, delivered
+
+    async def test_broadcast_weigh_in_is_delivered_without_connecting_first(self):
+        wi = broadcast(4, [weigh_in_object(7215, 1790000000)], with_mac=False)
+        syncs, delivered = await self.run_passive([broadcast(3, [HEARTBEAT]), wi, wi, wi])
+        self.assertEqual(delivered, [(72.15, 1790000000)])  # once, though seen 3 times
+        self.assertEqual(syncs, 1)  # then one sync, for the clock and the scale's memory
+
+    async def test_heartbeat_broadcasts_never_connect(self):
+        syncs, delivered = await self.run_passive([broadcast(n, [HEARTBEAT]) for n in range(1, 8)] + [None, 9, 10])
+        self.assertEqual((syncs, delivered), (0, []))
+
+    async def test_notification_goes_to_the_backend(self):
+        api = FakeBackendApi()
+        reader = await self.make_reader(api)
+        self.assertTrue(await reader.notify("Titel", "Tekst"))
+        self.assertEqual(api.notifications, [{"title": "Titel", "body": "Tekst"}])
+
+    async def test_alerts_once_when_the_scale_goes_silent_and_when_it_is_back(self):
+        sent = []
+
+        async def fake_notify(reader, title, body):
+            sent.append(title)
+            return True
+
+        with (
+            mock.patch.object(scale_reader, "SILENT_ALERT_S", 0),
+            mock.patch.object(scale_reader.Reader, "notify", fake_notify),
+        ):
+            await self.run_main([None, None, 3, 3, None, None])
+        self.assertEqual(sent, [scale_reader.SILENT_TITLE, scale_reader.BACK_TITLE, scale_reader.SILENT_TITLE])
+
+    async def test_alert_retried_when_the_backend_is_down(self):
+        results = iter([False, True])
+        sent = []
+
+        async def flaky_notify(reader, title, body):
+            sent.append(title)
+            return next(results)
+
+        with (
+            mock.patch.object(scale_reader, "SILENT_ALERT_S", 0),
+            mock.patch.object(scale_reader, "NOTIFY_RETRY_S", 0),
+            mock.patch.object(scale_reader.Reader, "notify", flaky_notify),
+        ):
+            await self.run_main([None, None, None])
+        self.assertEqual(sent, [scale_reader.SILENT_TITLE, scale_reader.SILENT_TITLE])
+
+    async def test_one_sync_for_weigh_ins_in_quick_succession(self):
+        sightings = [
+            broadcast(4, [weigh_in_object(7215, 1790000000)], with_mac=False),
+            broadcast(5, [HEARTBEAT]),
+            broadcast(6, [weigh_in_object(9100, 1790000600)], with_mac=False),
+        ]
+        syncs, delivered = await self.run_passive(sightings)
+        self.assertEqual(delivered, [(72.15, 1790000000), (91.0, 1790000600)])
+        self.assertEqual(syncs, 1)
+
+    async def test_failed_sync_after_weigh_in_waits_for_the_next_one(self):
+        sightings = [broadcast(4, [weigh_in_object(7215, 1790000000)], with_mac=False)] + [
+            broadcast(n, [HEARTBEAT]) for n in range(5, 9)
+        ]
+        with mock.patch.object(scale_reader, "FAILED_SYNC_BACKOFF_S", 0):
+            syncs, _ = await self.run_passive(sightings, collected=[None])
+        self.assertEqual(syncs, 1)
+
+    async def test_every_weigh_in_gets_collected_when_spaced_out(self):
+        sightings = [
+            broadcast(4, [weigh_in_object(7215, 1790000000)], with_mac=False),
+            broadcast(6, [weigh_in_object(9100, 1790086400)], with_mac=False),
+        ]
+        with mock.patch.object(scale_reader, "SYNC_AFTER_WEIGH_IN_S", 0):
+            syncs, delivered = await self.run_passive(sightings)
+        self.assertEqual((syncs, len(delivered)), (2, 2))
 
     async def test_exits_when_scanning_keeps_failing(self):
         # e.g. the adapter vanished: exit so Docker restarts the container
