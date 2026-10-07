@@ -317,11 +317,11 @@ param:   <piid:le16> <type_len:le16 = type << 12 | length> <value>
 types seen: 0x1 u8, 0x3 u16 (le), 0x8 u64 (le), 0xa string
 ```
 
-Example: a live-weight event, 90.00 kg, not yet stable:
+Example: a live-weight event, 70.00 kg, not yet stable:
 
 ```
-19 20  0f 00  07  05 03 00 03   01 00 01 10 00   02 00 01 10 00   03 00 02 30 28 23
-len    tid    ev  5.3   (3 params) p1 u8 = 0      p2 u8 = 0         p3 u16 = 0x2328 = 9000
+19 20  0f 00  07  05 03 00 03   01 00 01 10 00   02 00 01 10 00   03 00 02 30 58 1b
+len    tid    ev  5.3   (3 params) p1 u8 = 0      p2 u8 = 0         p3 u16 = 0x1b58 = 7000
 ```
 
 ### Services

@@ -338,9 +338,9 @@ class CodecTests(unittest.TestCase):
 
     def test_captured_messages(self):
         # Decrypted plaintexts in the exact format of the Xiaomi app captures
-        # (the weight changed to 90.00 kg).
-        live = decode_message(bytes.fromhex("19200f00070503000301000110000200011001030002302823"))
-        self.assertEqual((live.op, live.siid, live.iid, live.params), (OP_EVENT, 5, 3, {1: 0, 2: 1, 3: 9000}))
+        # (the weight changed to 70.00 kg).
+        live = decode_message(bytes.fromhex("19200f00070503000301000110000200011001030002" + "30" + (7000).to_bytes(2, "little").hex()))
+        self.assertEqual((live.op, live.siid, live.iid, live.params), (OP_EVENT, 5, 3, {1: 0, 2: 1, 3: 7000}))
         count = decode_message(bytes.fromhex("0d200400060000010300011012"))
         self.assertEqual((count.op, count.status, count.params), (OP_RESULT, 0, {3: 18}))
         done = decode_message(bytes.fromhex("07200c00060000"))
@@ -356,8 +356,8 @@ class CodecTests(unittest.TestCase):
         self.assertEqual((records[0].record_no, records[0].weight_kg, records[0].timestamp), (1, 80.01, 1789700001))
 
     def test_finished_weigh_in(self):
-        w = scale_reader.parse_weigh_in("1,1,9000,0,1789901471", numbered=False)
-        self.assertEqual((w.weight_kg, w.timestamp, w.record_no), (90.0, 1789901471, None))
+        w = scale_reader.parse_weigh_in("1,1,7000,0,1789901471", numbered=False)
+        self.assertEqual((w.weight_kg, w.timestamp, w.record_no), (70.0, 1789901471, None))
         self.assertIsNone(scale_reader.parse_weigh_in("garbage", numbered=False))
 
 
@@ -383,13 +383,13 @@ class SessionTests(ScannerTestCase):
     async def test_several_weigh_ins_in_one_session(self):
         # Stepping on again (holding something) before the scale goes back
         # to sleep: all of them should arrive, not just the first.
-        FakeClient.scale = scale = FakeScale(live=[[9000, 7120], [9500, 9650], [10200]])
+        FakeClient.scale = scale = FakeScale(live=[[7000, 7120], [7500, 7650], [10200]])
         api = FakeBackendApi()
         collected = await scale_reader.run_session(object(), await self.make_reader(api))
         self.assertEqual(scale.errors, [])
         self.assertEqual(collected, 3)
-        self.assertEqual([e["weight_kg"] for e in api.entries], [71.2, 96.5, 102.0])
-        self.assertEqual([c[2] for c in scale.claimed], [7120, 9650, 10200])
+        self.assertEqual([e["weight_kg"] for e in api.entries], [71.2, 76.5, 102.0])
+        self.assertEqual([c[2] for c in scale.claimed], [7120, 7650, 10200])
 
     async def test_scale_hanging_up_ends_session_normally(self):
         FakeClient.scale = scale = FakeScale(live=[[7120]], hang_up_after=0.8)
@@ -401,54 +401,54 @@ class SessionTests(ScannerTestCase):
         self.assertEqual([e["weight_kg"] for e in api.entries], [71.2])
 
     async def test_keep_on_scale_leaves_everything_in_place(self):
-        stored = {1: (9000, int(time.time()) - 3600)}
+        stored = {1: (7000, int(time.time()) - 3600)}
         FakeClient.scale = scale = FakeScale(stored=dict(stored), live=[[7120]])
         api = FakeBackendApi()
         with mock.patch.object(scale_reader, "KEEP_ON_SCALE", True):
             await scale_reader.run_session(object(), await self.make_reader(api))
         await asyncio.sleep(0.7)  # FakeScale keeps an unclaimed weigh-in after 0.5s
         self.assertEqual(scale.errors, [])
-        self.assertEqual([e["weight_kg"] for e in api.entries], [90.0, 71.2])
+        self.assertEqual([e["weight_kg"] for e in api.entries], [70.0, 71.2])
         self.assertEqual(scale.claimed, [])
         self.assertEqual(len(scale.stored), 2)
 
     async def test_without_webhook_prints_json_lines(self):
-        FakeClient.scale = scale = FakeScale(stored={1: (9000, 1790000000)})
+        FakeClient.scale = scale = FakeScale(stored={1: (7000, 1790000000)})
         with (
             mock.patch.object(scale_reader, "WEBHOOK_URL", ""),
             mock.patch("builtins.print") as printed,
         ):
             await scale_reader.run_session(object(), await self.make_reader(FakeBackendApi()))
-        printed.assert_called_once_with('{"weight_kg": 90.0, "recorded_at": "2026-09-21T14:13:20Z"}', flush=True)
+        printed.assert_called_once_with('{"weight_kg": 70.0, "recorded_at": "2026-09-21T14:13:20Z"}', flush=True)
         self.assertEqual(scale.stored, {})
 
     async def test_small_mtu_uses_multi_parcel_values(self):
-        FakeClient.scale = scale = FakeScale(stored={1: (9010, int(time.time()) - 60)}, max_value=20)
+        FakeClient.scale = scale = FakeScale(stored={1: (7010, int(time.time()) - 60)}, max_value=20)
         api = FakeBackendApi()
         await scale_reader.run_session(object(), await self.make_reader(api))
         self.assertEqual(scale.errors, [])
-        self.assertEqual([e["weight_kg"] for e in api.entries], [90.1])
+        self.assertEqual([e["weight_kg"] for e in api.entries], [70.1])
 
     async def test_failed_delivery_leaves_weigh_ins_on_scale(self):
-        stored = {1: (9000, int(time.time()) - 3600)}
+        stored = {1: (7000, int(time.time()) - 3600)}
         FakeClient.scale = scale = FakeScale(stored=dict(stored))
         await scale_reader.run_session(object(), await self.make_reader(FakeBackendApi(fail=True)))
         self.assertEqual(scale.errors, [])
         self.assertEqual(scale.stored, stored)
 
     async def test_unclaimed_weigh_in_is_collected_later_without_duplicate(self):
-        FakeClient.scale = scale = FakeScale(live=[[9100]])
+        FakeClient.scale = scale = FakeScale(live=[[7300]])
         api = FakeBackendApi(fail=True)  # live weigh-in fails to deliver, so it isn't claimed
         await scale_reader.run_session(object(), await self.make_reader(api))
         await asyncio.sleep(0.7)  # FakeScale keeps an unclaimed weigh-in after 0.5s
         self.assertEqual(len(scale.stored), 1)
         api.fail = False
         await scale_reader.run_session(object(), await self.make_reader(api))
-        self.assertEqual([e["weight_kg"] for e in api.entries], [91.0])
+        self.assertEqual([e["weight_kg"] for e in api.entries], [73.0])
         self.assertEqual(scale.stored, {})
 
     async def test_stalled_login_is_retried(self):
-        FakeClient.scale = scale = FakeScale(stored={1: (9000, int(time.time()) - 60)}, stall_logins=1)
+        FakeClient.scale = scale = FakeScale(stored={1: (7000, int(time.time()) - 60)}, stall_logins=1)
         api = FakeBackendApi()
         with mock.patch.object(scale_reader, "find_scale", mock.AsyncMock(return_value=(object(), None))):
             ok = await scale_reader.sync_wakeup(object(), await self.make_reader(api))
@@ -641,14 +641,31 @@ class WakeUpPolicyTests(ScannerTestCase):
             await self.run_main([None, None, None])
         self.assertEqual(sent, [scale_reader.SILENT_TITLE, scale_reader.SILENT_TITLE])
 
+    async def test_scale_asking_for_a_connection_triggers_a_sync(self):
+        # 2026-10-07: the weigh-in broadcast was missed between two checks;
+        # the scale then advertised 0x5b10 ("connect to me") for minutes.
+        syncs, _ = await self.run_passive([adv(1, 0x5910), adv(2, 0x5910), adv(2, 0x5B10), adv(2, 0x5B10)])
+        self.assertEqual(syncs, 1)
+
+    async def test_fruitless_or_failed_requests_are_muted(self):
+        with mock.patch.object(scale_reader, "SYNC_AFTER_WEIGH_IN_S", 0), mock.patch.object(scale_reader, "FAILED_SYNC_BACKOFF_S", 0):
+            syncs, _ = await self.run_passive([adv(2, 0x5B10)] * 4, collected=[0])
+            self.assertEqual(syncs, 1)
+            syncs, _ = await self.run_passive([adv(2, 0x5B10)] * 4, collected=[None])
+            self.assertEqual(syncs, 1)
+            # ...but a weigh-in broadcast still gets its sync
+            sightings = [adv(2, 0x5B10), broadcast(3, [weigh_in_object(7215, 1790000000)], with_mac=False)]
+            syncs, _ = await self.run_passive(sightings, collected=[None])
+            self.assertEqual(syncs, 2)
+
     async def test_one_sync_for_weigh_ins_in_quick_succession(self):
         sightings = [
             broadcast(4, [weigh_in_object(7215, 1790000000)], with_mac=False),
             broadcast(5, [HEARTBEAT]),
-            broadcast(6, [weigh_in_object(9100, 1790000600)], with_mac=False),
+            broadcast(6, [weigh_in_object(7300, 1790000600)], with_mac=False),
         ]
         syncs, delivered = await self.run_passive(sightings)
-        self.assertEqual(delivered, [(72.15, 1790000000), (91.0, 1790000600)])
+        self.assertEqual(delivered, [(72.15, 1790000000), (73.0, 1790000600)])
         self.assertEqual(syncs, 1)
 
     async def test_failed_sync_after_weigh_in_waits_for_the_next_one(self):
@@ -662,7 +679,7 @@ class WakeUpPolicyTests(ScannerTestCase):
     async def test_every_weigh_in_gets_collected_when_spaced_out(self):
         sightings = [
             broadcast(4, [weigh_in_object(7215, 1790000000)], with_mac=False),
-            broadcast(6, [weigh_in_object(9100, 1790086400)], with_mac=False),
+            broadcast(6, [weigh_in_object(7300, 1790086400)], with_mac=False),
         ]
         with mock.patch.object(scale_reader, "SYNC_AFTER_WEIGH_IN_S", 0):
             syncs, delivered = await self.run_passive(sightings)

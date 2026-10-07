@@ -61,13 +61,19 @@ the frame or the configured one) + product id (2) + frame counter (1) +
 payload = ciphertext + extended counter + tag. Objects: <u16 id><u8 len>
 <value>.
 Confirmed on this unit on 2026-10-07 (right weight and timestamp). So with
-a bindkey, weigh-ins come from the broadcast, and a connection is only
-attempted right after a weigh-in broadcast (at most once per
-SYNC_AFTER_WEIGH_IN_S, at most SYNC_ATTEMPTS tries): the scale is fully
-awake then, and collecting + deleting the weigh-in lets it sleep. Left
-uncollected, it kept advertising "connect to me" (frame control 0x5b10)
-for 5 minutes. The sync also sets the scale's clock (the broadcast
-timestamp comes from it) and collects anything the broadcasts missed.
+a bindkey, weigh-ins come from the broadcast. A connection is only
+attempted (at most once per SYNC_AFTER_WEIGH_IN_S, at most SYNC_ATTEMPTS
+tries) when the scale is fully awake because it was just used:
+  - right after a weigh-in broadcast, or
+  - when the frame control has bit 9 set (0x5b10 instead of 0x5910): the
+    scale asking for a connection. It does that while a weigh-in waits to
+    be collected -- for 5 minutes on 2026-10-07 -- so this also catches
+    weigh-in broadcasts the scanning missed (one was, the same day: it
+    only saw the frame counter move). If such a sync finds nothing, or any
+    sync fails, the request is ignored for SOLICIT_QUIET_S.
+Collecting + deleting the weigh-in lets the scale sleep. The sync also
+sets the scale's clock (the broadcast timestamp comes from it) and
+collects anything the broadcasts missed.
 Never connect otherwise: ~40 attempts during the 50-minute broadcasts all
 failed on 2026-10-01/02, and the last one apparently left the scale stuck
 "connected" (solid Bluetooth icon, no broadcasts at all) for 4.5 days,
@@ -226,10 +232,12 @@ PROFILE_WEIGHT_KG = float(os.environ.get("XIAOMI_PROFILE_WEIGHT_KG", "80"))
 # One discovery window: find_scale() returns as soon as the scale is seen,
 # or after this long if it isn't.
 SCAN_WINDOW_S = 10
-# While the scale is advertising: how long between checks of its MiBeacon
-# counter. Short, because without a connection the scale can fall asleep
-# ~15s after a weigh-in; checking doesn't connect.
-AWAKE_RECHECK_S = 2
+# While the scale is advertising: how long between checks of its
+# advertisement. Short: the weigh-in broadcast only lasts a moment (a 2s
+# interval missed one on 2026-10-07), and checking doesn't connect. Each
+# check is a fresh discovery session, because the controller only reports
+# the first advertisement per device per session.
+AWAKE_RECHECK_S = 0.3
 # The scale broadcasts something every ~50 minutes, day and night. Not
 # hearing it for this long means it's stuck, out of batteries or out of
 # range: push an alert to the user (once, until it's heard again).
@@ -261,10 +269,15 @@ FAILED_SYNC_BACKOFF_MAX_S = 1800
 # FRUITLESS_WINDOW_S, ignore the counter for that long.
 MAX_FRUITLESS_SYNCS = 3
 FRUITLESS_WINDOW_S = 3600
-# With XIAOMI_BINDKEY: connect right after a weigh-in broadcast, unless the
-# last connection attempt was less than this long ago (several step-ons in
-# a row: the broadcasts deliver each, one sync collects them).
+# With XIAOMI_BINDKEY: connect right after a weigh-in broadcast or when the
+# scale asks for it, unless the last connection attempt was less than this
+# long ago (several step-ons in a row: the broadcasts deliver each, one sync
+# collects them).
 SYNC_AFTER_WEIGH_IN_S = 600
+# Frame control bit 9: the scale asks for a connection (see the module
+# docstring). A sync on that request that finds nothing mutes it this long.
+FC_SOLICITED = 0x0200
+SOLICIT_QUIET_S = 3 * 3600
 # Connection attempts per sync. Kept low: each failed attempt risks leaving
 # the scale stuck "connected" (see the module docstring).
 SYNC_ATTEMPTS = 2
@@ -999,6 +1012,7 @@ async def main():
         backoff = FAILED_SYNC_BACKOFF_S
         fruitless: list[float] = []  # when counter-triggered syncs found nothing
         ignore_counter_until = 0.0
+        solicit_quiet_until = 0.0
         last_seen = None
         advertising = False  # for the log only
         last_beacon = None  # (frame control, counter) last seen, for the log only
@@ -1059,13 +1073,19 @@ async def main():
                             weigh_in_broadcast = True
 
             counter = beacon_counter(adv)
-            by_counter = False
+            by_counter = by_solicit = False
             if now < retry_at:
                 reason = None
             elif passive:
                 reason = None
-                if weigh_in_broadcast and (last_attempt is None or now - last_attempt >= SYNC_AFTER_WEIGH_IN_S):
+                solicited = beacon[0] is not None and beacon[0] & FC_SOLICITED and now >= solicit_quiet_until
+                if last_attempt is not None and now - last_attempt < SYNC_AFTER_WEIGH_IN_S:
+                    pass
+                elif weigh_in_broadcast:
                     reason = "weigh-in broadcast received, collecting it so the scale can sleep"
+                elif solicited:
+                    reason = f"scale asks for a connection (frame control {beacon[0]:#06x})"
+                    by_solicit = True
             elif expected is None:
                 reason = f"first sighting since the reader started ({describe_adv(adv)})"
             elif counter is not None and counter != expected and now >= ignore_counter_until:
@@ -1091,10 +1111,17 @@ async def main():
                 log.info("sync failed; next attempt in %ds at the earliest", backoff)
                 retry_at = now + backoff
                 backoff = min(backoff * 2, FAILED_SYNC_BACKOFF_MAX_S)
+                # Don't keep answering the scale's requests over a link that
+                # fails: repeated failed attempts are what left it stuck on
+                # 2026-10-02. The next weigh-in broadcast still triggers one.
+                solicit_quiet_until = now + SOLICIT_QUIET_S
                 continue
             backoff = FAILED_SYNC_BACKOFF_S
             last_sync = now
 
+            if by_solicit and collected == 0:
+                log.info("nothing to collect; ignoring the scale's connection requests for %ds", SOLICIT_QUIET_S)
+                solicit_quiet_until = now + SOLICIT_QUIET_S
             if by_counter and collected == 0:
                 fruitless = [t for t in fruitless if now - t < FRUITLESS_WINDOW_S] + [now]
                 if len(fruitless) >= MAX_FRUITLESS_SYNCS:
